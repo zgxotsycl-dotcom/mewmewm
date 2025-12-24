@@ -1,0 +1,31 @@
+{
+  "name": "mewdle",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "concurrently -k \"parcel watch src/client/index.html --dist-dir dist\" \"ts-node src/server/server.ts\"",
+    "build": "parcel build src/client/index.html --dist-dir dist",
+    "start": "ts-node src/server/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "ts-node scripts/test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "mewdle",
+  "dependencies": {
+    "express": "^5.2.1",
+    "pixi.js": "^8.14.3",
+    "socket.io": "^4.8.2",
+    "socket.io-client": "^4.8.2",
+    "three": "^0.178.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.3",
+    "@types/three": "^0.182.0",
+    "concurrently": "^9.2.1",
+    "parcel": "^2.16.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
