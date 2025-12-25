@@ -10,6 +10,17 @@ export interface WorldConfig {
 
 export type WormClass = 'iron' | 'shadow' | 'magnetic';
 
+export type WormSkin =
+  | 'viper'
+  | 'eel'
+  | 'venom'
+  | 'scarab'
+  | 'frost'
+  | 'plasma'
+  | 'chrono'
+  | 'mirage'
+  | 'void';
+
 export type MutationStage = 1 | 2 | 3;
 
 export type MutationId =
@@ -21,6 +32,16 @@ export type MutationId =
   | 'sixth_sense'
   | 'spiked_tail'
   | 'toxic_trail'
+  // Character skills (skin-based)
+  | 'skill_viper_blender'
+  | 'skill_eel_overdrive'
+  | 'skill_venom_gas'
+  | 'skill_scarab_thorns'
+  | 'skill_frost_domain'
+  | 'skill_plasma_ray'
+  | 'skill_chrono_rewind'
+  | 'skill_mirage_clones'
+  | 'skill_void_maw'
   // Legacy ids (kept for compatibility)
   | 'spiky_skin'
   | 'double_jaw'
@@ -71,6 +92,15 @@ export interface GasState {
   r: number;
 }
 
+export interface IceState {
+  id: string;
+  ownerId: string;
+  x: number;
+  y: number;
+  r: number;
+  expiresAt: number;
+}
+
 export interface BlackHoleState {
   id: string;
   ownerId: string;
@@ -86,6 +116,7 @@ export interface DecoyState {
   name: string;
   color: number;
   dna: WormClass;
+  skin: WormSkin;
   originalLen: number;
   segments: Vec2[];
 }
@@ -96,11 +127,13 @@ export interface PlayerState {
   color: number;
   boost: boolean;
   dna: WormClass;
+  skin: WormSkin;
   armor: number;
   stealth: boolean;
   phase: boolean;
   evoStage: number;
   nextEvoScore: number;
+  skill: MutationId;
   skillCdMs: number;
   skillActive: boolean;
   mutations: MutationId[];
@@ -122,6 +155,7 @@ export interface StatePayload {
   decoys: DecoyState[];
   foods: FoodState[];
   gas: GasState[];
+  ice: IceState[];
   blackHoles: BlackHoleState[];
   leaderboard: LeaderboardEntry[];
 }
@@ -138,7 +172,7 @@ export interface DeadPayload {
 }
 
 export interface ClientToServerEvents {
-  join: (payload: { name: string; dna: WormClass }) => void;
+  join: (payload: { name: string; dna: WormClass; skin: WormSkin }) => void;
   input: (payload: { angle: number; boost: boolean }) => void;
   ability: (payload: { type: 'skill'; action?: 'tap' | 'start' | 'end'; x?: number; y?: number }) => void;
   chooseMutation: (payload: { id: MutationId }) => void;

@@ -94,7 +94,7 @@
 
       .menu-left {
         position: absolute;
-        left: max(40vw, 420px);
+        left: 40vw;
         top: 50%;
         transform: translate(-50%, -50%);
         width: min(820px, 44vw);
@@ -147,7 +147,7 @@
       .menu-right {
         pointer-events: auto;
         position: absolute;
-        left: min(80vw, calc(100vw - 240px));
+        left: clamp(240px, 80vw, calc(100vw - 240px));
         top: 50%;
         --dx: 0px;
         transform: translate(calc(-50% + var(--dx)), -50%);
@@ -828,9 +828,9 @@
         width: 100%;
         height: auto;
         margin-top: 8px;
-        border-radius: 12px;
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 50%;
+        background: #0a0c12;
+        border: 1px solid rgba(255, 255, 255, 0.12);
       }
 
       .box .title {

@@ -5,12 +5,22 @@ import path from 'path';
 
 import {
   buildOfferMilestones,
+  CLASS_BASE_SKILL,
   EVO_THRESHOLDS,
   MIN_SEGMENTS,
+  SKIN_BASE_SKILL,
   OFFER_COUNTS,
   START_MASS,
   skillCooldownMs,
 } from '../shared/balance';
+
+import {
+  classForSkin,
+  defaultSkinForClass,
+  randomColorForSkin,
+  randomSkinForClass,
+  sanitizeSkin,
+} from '../shared/characters';
 
 import {
   IRON_ARMOR_BOOST_RECOVER,
@@ -29,6 +39,7 @@ import type {
   DecoyState,
   FoodState,
   GasState,
+  IceState,
   LeaderboardEntry,
   MutationChoice,
   MutationId,
@@ -40,6 +51,7 @@ import type {
   Vec2,
   WorldConfig,
   WormClass,
+  WormSkin,
 } from '../shared/protocol';
 
 const app = express();
@@ -63,6 +75,9 @@ interface Food {
   kind: FoodKind;
 }
 
+type ChronoSnapshot = { t: number; x: number; y: number; angle: number; scoreAcc: number; len: number };
+type ChronoPoint = { x: number; y: number; angle: number };
+
 interface Player {
   id: string;
   name: string;
@@ -74,6 +89,7 @@ interface Player {
   scoreAcc: number;
   score: number;
   dna: WormClass;
+  skin: WormSkin;
   armor: number;
   slowUntil: number;
   stealthUntil: number;
@@ -103,10 +119,21 @@ interface Player {
   boostBurnUntil: number;
   boostBurnStacks: number;
   boostBurnAcc: number;
-  skill: MutationId | null;
+  gasDebuffUntil: number;
+  iceSlipUntil: number;
+  turnLockUntil: number;
+  plasmaDamageAcc: number;
+  skill: MutationId;
   skillCooldownUntil: number;
   skillActiveUntil: number;
   skillHeld: boolean;
+  chronoHistory: ChronoSnapshot[];
+  chronoNextSampleAt: number;
+  chronoRewindStartAt: number;
+  chronoRewindUntil: number;
+  chronoRewindPath: ChronoPoint[];
+  chronoTargetScoreAcc: number;
+  chronoTargetLen: number;
   magnetUntil: number;
   goldrushUntil: number;
   overchargeUntil: number;
@@ -153,13 +180,14 @@ class SpatialGrid<T> {
   }
 
   // Get objects from the surrounding 9 cells (including the current one).
-  getNearby(x: number, y: number): T[] {
+  getNearby(x: number, y: number, range: number = 1): T[] {
     const out: T[] = [];
     const cx = Math.floor(x / this.cellSize);
     const cy = Math.floor(y / this.cellSize);
+    const r = Math.max(0, Math.floor(range));
 
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dy = -r; dy <= r; dy++) {
         const key = `${cx + dx},${cy + dy}`;
         const cell = this.cells.get(key);
         if (!cell) continue;
@@ -171,6 +199,321 @@ class SpatialGrid<T> {
 
   clear(): void {
     this.cells.clear();
+  }
+}
+
+function isInsideGas(pos: Vec2): boolean {
+  const nearby = gasGrid.getNearby(pos.x, pos.y, 1);
+  for (const cloud of nearby) {
+    const dx = cloud.x - pos.x;
+    const dy = cloud.y - pos.y;
+    if (dx * dx + dy * dy <= cloud.r * cloud.r) return true;
+  }
+  return false;
+}
+
+function isInsideIce(pos: Vec2, selfId: string): boolean {
+  const range = Math.max(1, Math.ceil(FROST_DOMAIN_RADIUS / GRID_CELL_SIZE));
+  const nearby = iceGrid.getNearby(pos.x, pos.y, range);
+  for (const zone of nearby) {
+    if (zone.ownerId === selfId) continue;
+    const dx = zone.x - pos.x;
+    const dy = zone.y - pos.y;
+    if (dx * dx + dy * dy <= zone.r * zone.r) return true;
+  }
+  return false;
+}
+
+function recordChronoHistory(player: Player, now: number): void {
+  if (now < player.chronoNextSampleAt) return;
+  const head = player.segments[0];
+  if (!head) return;
+
+  player.chronoHistory.push({
+    t: now,
+    x: head.x,
+    y: head.y,
+    angle: player.angle,
+    scoreAcc: player.scoreAcc,
+    len: player.segments.length,
+  });
+  player.chronoNextSampleAt = now + CHRONO_HISTORY_SAMPLE_MS;
+
+  const cutoff = now - CHRONO_HISTORY_KEEP_MS;
+  while (player.chronoHistory.length > 2 && (player.chronoHistory[0]?.t ?? now) < cutoff) {
+    player.chronoHistory.shift();
+  }
+}
+
+function lerpAngle(a: number, b: number, t: number): number {
+  const d = normalizeAngle(b - a);
+  return normalizeAngle(a + d * t);
+}
+
+function rebuildTrailFromSegments(player: Player): void {
+  const segs = player.segments;
+  player.trail = [];
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const s = segs[i];
+    if (!s) continue;
+    player.trail.push({ x: s.x, y: s.y });
+  }
+  player.trailStart = 0;
+  player.trailLen = 0;
+  for (let i = 1; i < player.trail.length; i++) {
+    const a = player.trail[i - 1];
+    const b = player.trail[i];
+    if (!a || !b) continue;
+    player.trailLen += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+}
+
+function startChronoRewind(player: Player, now: number): boolean {
+  const head = player.segments[0];
+  if (!head) return false;
+
+  const targetTime = now - CHRONO_REWIND_LOOKBACK_MS;
+  const history = player.chronoHistory;
+  if (history.length <= 0) return false;
+
+  let snap = history[0]!;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const s = history[i]!;
+    if (s.t <= targetTime) {
+      snap = s;
+      break;
+    }
+    snap = s;
+  }
+
+  const path: ChronoPoint[] = [{ x: head.x, y: head.y, angle: player.angle }];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const s = history[i]!;
+    if (s.t < targetTime) break;
+    path.push({ x: s.x, y: s.y, angle: s.angle });
+  }
+  if (path.length < 2) return false;
+
+  player.chronoRewindPath = path;
+  player.chronoRewindStartAt = now;
+  player.chronoRewindUntil = now + CHRONO_REWIND_MS;
+  player.chronoTargetScoreAcc = snap.scoreAcc;
+  player.chronoTargetLen = snap.len;
+  player.boost = false;
+  player.boostBlend = 0;
+  player.boostDrain = 0;
+  return true;
+}
+
+function stepChronoRewind(player: Player, now: number): void {
+  const head = player.segments[0];
+  if (!head) return;
+  const path = player.chronoRewindPath;
+  if (!path || path.length < 2) return;
+
+  const elapsed = now - player.chronoRewindStartAt;
+  const t = clamp(elapsed / Math.max(1, CHRONO_REWIND_MS), 0, 1);
+  const f = t * (path.length - 1);
+  const i0 = Math.max(0, Math.min(path.length - 1, Math.floor(f)));
+  const i1 = Math.max(0, Math.min(path.length - 1, i0 + 1));
+  const a = f - i0;
+  const p0 = path[i0]!;
+  const p1 = path[i1]!;
+  const nx = p0.x + (p1.x - p0.x) * a;
+  const ny = p0.y + (p1.y - p0.y) * a;
+
+  const dx = nx - head.x;
+  const dy = ny - head.y;
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return;
+
+  for (const seg of player.segments) {
+    seg.x += dx;
+    seg.y += dy;
+  }
+
+  player.angle = lerpAngle(p0.angle, p1.angle, a);
+  player.inputAngle = player.angle;
+  player.boost = false;
+  player.boostBlend = 0;
+  player.boostDrain = 0;
+
+  // Phase + invulnerable while rewinding so it reads as "time magic", not a teleport-collision exploit.
+  player.phaseUntil = Math.max(player.phaseUntil, now + 140);
+  player.invulnerableUntil = Math.max(player.invulnerableUntil, now + 140);
+
+  // Push away heads along the rewind path so other players don't get clipped.
+  const newHead = player.segments[0];
+  if (!newHead) return;
+  const pushR = headRadiusForPlayer(player) * 2.1 + 70;
+  const pushR2 = pushR * pushR;
+  for (const other of players.values()) {
+    if (other.id === player.id) continue;
+    if (now - other.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
+    if (isPhaseActive(other, now)) continue;
+    const oh = other.segments[0];
+    if (!oh) continue;
+    const ox = oh.x - newHead.x;
+    const oy = oh.y - newHead.y;
+    const d2 = ox * ox + oy * oy;
+    if (d2 > pushR2 || d2 === 0) continue;
+    const d = Math.sqrt(d2) || 1;
+    const strength = (pushR - d) * 0.55;
+    pushWholeWorm(other, (ox / d) * strength, (oy / d) * strength);
+  }
+}
+
+function finishChronoRewind(player: Player): void {
+  player.chronoRewindUntil = 0;
+  player.chronoRewindStartAt = 0;
+  player.chronoRewindPath = [];
+
+  const targetLen = Math.max(MIN_SEGMENTS, Math.round(player.chronoTargetLen));
+  if (player.segments.length > targetLen) {
+    player.segments.length = targetLen;
+  } else if (player.segments.length < targetLen) {
+    grow(player, targetLen - player.segments.length);
+  }
+
+  player.scoreAcc = Math.max(START_MASS, player.chronoTargetScoreAcc);
+  player.score = Math.max(0, Math.floor(player.scoreAcc));
+
+  player.boost = false;
+  player.boostBlend = 0;
+  player.boostDrain = 0;
+
+  rebuildTrailFromSegments(player);
+}
+
+function spawnMirageClones(player: Player, now: number): void {
+  const head = player.segments[0];
+  if (!head) return;
+
+  // Replace any existing clones owned by this player.
+  for (const [id, decoy] of decoys) {
+    if (decoy.ownerId === player.id) decoys.delete(id);
+  }
+
+  const baseAngle = rand(-Math.PI, Math.PI);
+  for (let i = 0; i < MIRAGE_CLONES_COUNT; i++) {
+    const angleOffset = baseAngle + (i / MIRAGE_CLONES_COUNT) * Math.PI * 2;
+    const id = String(nextDecoyId++);
+    decoys.set(id, {
+      id,
+      ownerId: player.id,
+      name: player.name,
+      color: player.color,
+      dna: player.dna,
+      skin: player.skin,
+      segments: player.segments.map((s) => ({ x: s.x, y: s.y })),
+      originalLen: player.segments.length,
+      spawnedAt: now,
+      angleOffset,
+      maxOffset: MIRAGE_CLONE_OFFSET_DIST,
+      expiresAt: now + MIRAGE_CLONES_MS,
+    });
+  }
+}
+
+function easeOutCubic(t: number): number {
+  const x = clamp(t, 0, 1);
+  return 1 - Math.pow(1 - x, 3);
+}
+
+function stepDecoys(now: number): void {
+  for (const decoy of decoys.values()) {
+    const owner = players.get(decoy.ownerId);
+    if (!owner) continue;
+    const ownerSegs = owner.segments;
+    if (ownerSegs.length === 0) continue;
+
+    // Animate the initial "burst" outwards.
+    const u = easeOutCubic((now - decoy.spawnedAt) / 900);
+    const dist = decoy.maxOffset * u;
+    const wobble = Math.sin(now / 380 + decoy.angleOffset * 3.0) * 18;
+    const ox = Math.cos(decoy.angleOffset);
+    const oy = Math.sin(decoy.angleOffset);
+    const offX = ox * dist + -oy * wobble;
+    const offY = oy * dist + ox * wobble;
+
+    const baseHead = ownerSegs[0]!;
+    const headPos = { x: baseHead.x + offX, y: baseHead.y + offY };
+    const clamped = clampToArena(headPos, HEAD_RADIUS + 80);
+    const cx = clamped.x - headPos.x;
+    const cy = clamped.y - headPos.y;
+    const finalOffX = offX + cx;
+    const finalOffY = offY + cy;
+
+    // Keep original length for the decoy (it matches the owner at cast time).
+    if (decoy.segments.length !== decoy.originalLen) {
+      const tail = decoy.segments[decoy.segments.length - 1] ?? baseHead;
+      while (decoy.segments.length < decoy.originalLen) decoy.segments.push({ x: tail.x, y: tail.y });
+      if (decoy.segments.length > decoy.originalLen) decoy.segments.length = decoy.originalLen;
+    }
+
+    for (let i = 0; i < decoy.segments.length; i++) {
+      const src = ownerSegs[Math.min(i, ownerSegs.length - 1)]!;
+      const seg = decoy.segments[i]!;
+      seg.x = src.x + finalOffX;
+      seg.y = src.y + finalOffY;
+    }
+  }
+}
+
+function isBoostingNow(player: Player, now: number): boolean {
+  if (isBunkerDownActive(player, now)) return false;
+  return player.boost && player.segments.length > MIN_SEGMENTS;
+}
+
+function stepPlasmaRays(now: number): void {
+  for (const attacker of players.values()) {
+    if (attacker.skill !== 'skill_plasma_ray') continue;
+    if (now >= attacker.skillActiveUntil) continue;
+    const head = attacker.segments[0];
+    if (!head) continue;
+
+    const fx = Math.cos(attacker.angle);
+    const fy = Math.sin(attacker.angle);
+
+    for (const victim of players.values()) {
+      if (victim.id === attacker.id) continue;
+      if (now - victim.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
+      if (isPhaseActive(victim, now)) continue;
+      if (isInvulnerableActive(victim, now)) continue;
+      if (isBoostingNow(victim, now)) continue; // counterplay: boosting worms are immune
+
+      const victimBodyR = bodyRadiusForPlayer(victim);
+      const hitWidth = PLASMA_RAY_HALF_WIDTH + victimBodyR * 0.9;
+      const hitWidth2 = hitWidth * hitWidth;
+
+      let hit = false;
+      for (let i = 0; i < victim.segments.length; i += 3) {
+        const p = victim.segments[i];
+        if (!p) continue;
+        const vx = p.x - head.x;
+        const vy = p.y - head.y;
+        const proj = vx * fx + vy * fy;
+        if (proj <= 0 || proj > PLASMA_RAY_RANGE) continue;
+        const px = vx - fx * proj;
+        const py = vy - fy * proj;
+        if (px * px + py * py <= hitWidth2) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
+
+      const segs = victim.segments.length;
+      const dmg = segs * PLASMA_RAY_DAMAGE_PER_SEC * DT;
+      victim.plasmaDamageAcc += dmg;
+
+      while (victim.plasmaDamageAcc >= 1) {
+        victim.plasmaDamageAcc -= 1;
+        if (victim.segments.length <= MIN_SEGMENTS) break;
+        victim.segments.pop();
+        victim.scoreAcc = Math.max(0, victim.scoreAcc - 1);
+        victim.score = Math.max(0, Math.floor(victim.scoreAcc));
+      }
+    }
   }
 }
 
@@ -243,6 +586,43 @@ const SINGULARITY_MAX_RANGE = 1400;
 const SHADOW_CLOAK_REFRESH_MS = 120;
 const SHADOW_CLOAK_FULL_DRAIN_MS = 4200;
 
+// Skin skills (9 characters)
+const VIPER_BLENDER_MS = 1500;
+const EEL_OVERDRIVE_MS = 3000;
+const VENOM_GAS_REFRESH_MS = 120;
+const VENOM_GAS_FULL_DRAIN_MS = 3000;
+const SCARAB_THORNS_MS = 3000;
+const FROST_DOMAIN_MS = 7000;
+const PLASMA_RAY_MS = 5000;
+const CHRONO_REWIND_LOOKBACK_MS = 3000;
+const CHRONO_REWIND_MS = 2000;
+const CHRONO_HISTORY_SAMPLE_MS = 80;
+const CHRONO_HISTORY_KEEP_MS = 5200;
+const MIRAGE_CLONES_COUNT = 9;
+const MIRAGE_CLONES_MS = 10000;
+const VOID_MAW_MS = 3000;
+
+// Skill tuning knobs (server-authoritative)
+const GAS_DEBUFF_LINGER_MS = 700;
+const GAS_BOOST_DRAIN_MUL = 1.45;
+
+const EEL_FIELD_STUN_MS = 500;
+const EEL_FIELD_RADIUS_EXTRA = 140;
+
+const FROST_DOMAIN_RADIUS = 820;
+const FROST_SLIP_LINGER_MS = 320;
+const FROST_SLIP_TURN_MUL = 0.45;
+
+const PLASMA_RAY_RANGE = 1700;
+const PLASMA_RAY_HALF_WIDTH = 120;
+const PLASMA_RAY_DAMAGE_PER_SEC = 0.01; // 1% of current length per second
+
+const VIPER_PULL_RADIUS = 1400;
+const VOID_MAW_PULL_RADIUS = 1500;
+const VOID_MAW_HALF_ANGLE = (60 * Math.PI) / 180;
+
+const MIRAGE_CLONE_OFFSET_DIST = 520;
+
 const HYPER_METABOLISM_GROWTH_MUL = 1.3;
 const HYPER_METABOLISM_DECAY_RATE = 0.12; // segments per second
 
@@ -270,6 +650,12 @@ const playerGrid = new SpatialGrid<PlayerBodySample>(GRID_CELL_SIZE);
 type GasCloud = { id: string; x: number; y: number; r: number; expiresAt: number };
 const gasClouds = new Map<string, GasCloud>();
 let nextGasId = 1;
+const gasGrid = new SpatialGrid<GasCloud>(GRID_CELL_SIZE);
+
+type IceZone = { id: string; ownerId: string; x: number; y: number; r: number; expiresAt: number };
+const iceZones = new Map<string, IceZone>();
+let nextIceZoneId = 1;
+const iceGrid = new SpatialGrid<IceZone>(GRID_CELL_SIZE);
 
 type BlackHole = { id: string; ownerId: string; x: number; y: number; r: number; expiresAt: number };
 const blackHoles = new Map<string, BlackHole>();
@@ -281,8 +667,12 @@ type Decoy = {
   name: string;
   color: number;
   dna: WormClass;
+  skin: WormSkin;
   segments: Vec2[];
   originalLen: number;
+  spawnedAt: number;
+  angleOffset: number;
+  maxOffset: number;
   expiresAt: number;
 };
 const decoys = new Map<string, Decoy>();
@@ -301,6 +691,7 @@ type BotProfile = {
   name: string;
   color: number;
   dna: WormClass;
+  skin: WormSkin;
 };
 
 type FoodKind = 'normal' | 'boost' | 'corpse' | 'bomb';
@@ -948,7 +1339,7 @@ function stopSkillHold(player: Player): void {
 }
 
 function handleSkillAction(player: Player, now: number, action: SkillAction, x?: number, y?: number): void {
-  if (!player.skill) return;
+  player.skill = SKIN_BASE_SKILL[player.skin] ?? CLASS_BASE_SKILL[player.dna];
   if (player.pendingStage !== 0) return;
 
   if (player.skill === 'shadow_phantom_decoy') {
@@ -966,13 +1357,41 @@ function handleSkillAction(player: Player, now: number, action: SkillAction, x?:
     return;
   }
 
+  if (player.skill === 'skill_venom_gas') {
+    if (action === 'end') {
+      stopSkillHold(player);
+      return;
+    }
+
+    const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 25000;
+    const energy = skillEnergyFraction(player, now, cooldownMs);
+    if (action === 'start') {
+      if (energy <= 0.001) return;
+      player.skillHeld = true;
+      player.skillCooldownUntil = Math.max(player.skillCooldownUntil, now);
+      player.skillActiveUntil = Math.max(player.skillActiveUntil, now + VENOM_GAS_REFRESH_MS);
+      return;
+    }
+
+    // Toggle on tap.
+    if (player.skillHeld) {
+      stopSkillHold(player);
+      return;
+    }
+    if (energy <= 0.001) return;
+    player.skillHeld = true;
+    player.skillCooldownUntil = Math.max(player.skillCooldownUntil, now);
+    player.skillActiveUntil = Math.max(player.skillActiveUntil, now + VENOM_GAS_REFRESH_MS);
+    return;
+  }
+
   if (action === 'end') return;
   const target = typeof x === 'number' && typeof y === 'number' ? { x, y } : undefined;
   useSkill(player, now, target);
 }
 
 function useSkill(player: Player, now: number, target?: Vec2): void {
-  if (!player.skill) return;
+  player.skill = SKIN_BASE_SKILL[player.skin] ?? CLASS_BASE_SKILL[player.dna];
   if (now < player.skillCooldownUntil) return;
   if (player.pendingStage !== 0) return;
 
@@ -1069,6 +1488,47 @@ function useSkill(player: Player, now: number, target?: Vec2): void {
   } else if (id === 'ultimate_magnetic_overcharge') {
     player.skillActiveUntil = now + 5000;
     player.overchargeUntil = Math.max(player.overchargeUntil, now + 5000);
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_viper_blender') {
+    player.skillActiveUntil = now + VIPER_BLENDER_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_eel_overdrive') {
+    player.skillActiveUntil = now + EEL_OVERDRIVE_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_venom_gas') {
+    // Toggle/energy skill handled by handleSkillAction + stepSkillHolds.
+    return;
+  } else if (id === 'skill_scarab_thorns') {
+    player.skillActiveUntil = now + SCARAB_THORNS_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_frost_domain') {
+    player.skillActiveUntil = now + FROST_DOMAIN_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+
+    const head = player.segments[0];
+    if (!head) return;
+
+    // Replace any existing ice zone owned by this player.
+    for (const [zoneId, zone] of iceZones) {
+      if (zone.ownerId === player.id) iceZones.delete(zoneId);
+    }
+
+    const zoneId = String(nextIceZoneId++);
+    const pos = clampToArena({ x: head.x, y: head.y }, FROST_DOMAIN_RADIUS + 40);
+    iceZones.set(zoneId, { id: zoneId, ownerId: player.id, x: pos.x, y: pos.y, r: FROST_DOMAIN_RADIUS, expiresAt: now + FROST_DOMAIN_MS });
+  } else if (id === 'skill_plasma_ray') {
+    player.skillActiveUntil = now + PLASMA_RAY_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_chrono_rewind') {
+    if (!startChronoRewind(player, now)) return;
+    player.skillActiveUntil = now + CHRONO_REWIND_MS;
+    player.skillCooldownUntil = now + cooldownMs;
+  } else if (id === 'skill_mirage_clones') {
+    player.skillActiveUntil = now + 600;
+    player.skillCooldownUntil = now + cooldownMs;
+    spawnMirageClones(player, now);
+  } else if (id === 'skill_void_maw') {
+    player.skillActiveUntil = now + VOID_MAW_MS;
     player.skillCooldownUntil = now + cooldownMs;
   }
 }
@@ -1200,12 +1660,14 @@ function randomSpawnPoint(): Vec2 {
 function createPlayer(
   id: string,
   name: string,
-  options?: { color?: number; initialSegments?: number; isBot?: boolean; dna?: WormClass },
+  options?: { color?: number; initialSegments?: number; isBot?: boolean; dna?: WormClass; skin?: WormSkin },
 ): Player {
   const spawn = randomSpawnPoint();
   const startAngle = rand(-Math.PI, Math.PI);
   const initialSegments = options?.initialSegments ?? 26;
-  const dna = options?.dna ?? 'shadow';
+  const desiredDna = sanitizeClass(options?.dna ?? 'shadow');
+  const skin = options?.skin ? sanitizeSkin(options.skin) : defaultSkinForClass(desiredDna);
+  const dna = classForSkin(skin);
 
   const segments: Vec2[] = [];
   for (let i = 0; i < initialSegments; i++) {
@@ -1230,7 +1692,7 @@ function createPlayer(
   return {
     id,
     name,
-    color: options?.color ?? randomClassColor(dna),
+    color: options?.color ?? randomColorForSkin(skin),
     segments,
     trail,
     trailStart: 0,
@@ -1238,6 +1700,7 @@ function createPlayer(
     scoreAcc: START_MASS,
     score: START_MASS,
     dna,
+    skin,
     armor: dna === 'iron' ? 2 : 0,
     slowUntil: 0,
     stealthUntil: 0,
@@ -1267,10 +1730,21 @@ function createPlayer(
     boostBurnUntil: 0,
     boostBurnStacks: 0,
     boostBurnAcc: 0,
-    skill: null,
+    gasDebuffUntil: 0,
+    iceSlipUntil: 0,
+    turnLockUntil: 0,
+    plasmaDamageAcc: 0,
+    skill: SKIN_BASE_SKILL[skin] ?? CLASS_BASE_SKILL[dna],
     skillCooldownUntil: 0,
     skillActiveUntil: 0,
     skillHeld: false,
+    chronoHistory: [{ t: Date.now(), x: spawn.x, y: spawn.y, angle: startAngle, scoreAcc: START_MASS, len: initialSegments }],
+    chronoNextSampleAt: Date.now() + CHRONO_HISTORY_SAMPLE_MS,
+    chronoRewindStartAt: 0,
+    chronoRewindUntil: 0,
+    chronoRewindPath: [],
+    chronoTargetScoreAcc: START_MASS,
+    chronoTargetLen: initialSegments,
     magnetUntil: 0,
     goldrushUntil: 0,
     overchargeUntil: 0,
@@ -1286,8 +1760,12 @@ function createPlayer(
   };
 }
 
-function resetPlayerForLobbyChoice(player: Player, dna: WormClass): void {
+function resetPlayerForLobbyChoice(player: Player, dna: WormClass, skin: WormSkin, color?: number): void {
   player.dna = dna;
+  player.skin = skin;
+  if (typeof color === 'number' && Number.isFinite(color)) {
+    player.color = color;
+  }
   player.armor = dna === 'iron' ? 2 : 0;
   player.scoreAcc = START_MASS;
   player.score = START_MASS;
@@ -1317,11 +1795,23 @@ function resetPlayerForLobbyChoice(player: Player, dna: WormClass): void {
   player.boostBurnUntil = 0;
   player.boostBurnStacks = 0;
   player.boostBurnAcc = 0;
+  player.gasDebuffUntil = 0;
+  player.iceSlipUntil = 0;
+  player.turnLockUntil = 0;
+  player.plasmaDamageAcc = 0;
 
-  player.skill = null;
+  player.skill = SKIN_BASE_SKILL[skin] ?? CLASS_BASE_SKILL[dna];
   player.skillCooldownUntil = 0;
   player.skillActiveUntil = 0;
   player.skillHeld = false;
+  const head = player.segments[0] ?? { x: 0, y: 0 };
+  player.chronoHistory = [{ t: Date.now(), x: head.x, y: head.y, angle: player.angle, scoreAcc: START_MASS, len: player.segments.length }];
+  player.chronoNextSampleAt = Date.now() + CHRONO_HISTORY_SAMPLE_MS;
+  player.chronoRewindStartAt = 0;
+  player.chronoRewindUntil = 0;
+  player.chronoRewindPath = [];
+  player.chronoTargetScoreAcc = START_MASS;
+  player.chronoTargetLen = player.segments.length;
   player.magnetUntil = 0;
   player.goldrushUntil = 0;
   player.overchargeUntil = 0;
@@ -1369,7 +1859,7 @@ function initBot(id: string): Player {
     throw new Error(`Unknown bot profile: ${id}`);
   }
 
-  const bot = createPlayer(id, profile.name, { color: profile.color, isBot: true, dna: profile.dna });
+  const bot = createPlayer(id, profile.name, { color: profile.color, isBot: true, dna: profile.dna, skin: profile.skin });
   bot.ai = {
     target: randomSpawnPoint(),
     nextDecisionAt: 0,
@@ -1461,29 +1951,61 @@ function stepSkillHolds(player: Player, now: number): void {
     return;
   }
 
-  if (player.skill !== 'shadow_phantom_decoy') {
-    player.skillHeld = false;
+  if (player.skill === 'shadow_phantom_decoy') {
+    const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 18000;
+    const energy = skillEnergyFraction(player, now, cooldownMs);
+    if (energy <= 0.001) {
+      player.skillHeld = false;
+      return;
+    }
+
+    player.skillActiveUntil = Math.max(player.skillActiveUntil, now + SHADOW_CLOAK_REFRESH_MS);
+    player.stealthUntil = Math.max(player.stealthUntil, now + SHADOW_CLOAK_REFRESH_MS);
+
+    const drainFactor = 1 + cooldownMs / Math.max(1, SHADOW_CLOAK_FULL_DRAIN_MS);
+    player.skillCooldownUntil = Math.max(now, player.skillCooldownUntil) + DT * 1000 * drainFactor;
+    player.skillCooldownUntil = Math.min(player.skillCooldownUntil, now + cooldownMs);
     return;
   }
 
-  const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 18000;
-  const energy = skillEnergyFraction(player, now, cooldownMs);
-  if (energy <= 0.001) {
-    player.skillHeld = false;
+  if (player.skill === 'skill_venom_gas') {
+    const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 25000;
+    const energy = skillEnergyFraction(player, now, cooldownMs);
+    if (energy <= 0.001) {
+      player.skillHeld = false;
+      return;
+    }
+
+    // Treat as a toggle-able energy skill. Energy drains only while boosting, but the toggle stays "armed".
+    player.skillActiveUntil = Math.max(player.skillActiveUntil, now + VENOM_GAS_REFRESH_MS);
+    const draining = player.boost && player.segments.length > MIN_SEGMENTS;
+    if (!draining) return;
+
+    const drainFactor = 1 + cooldownMs / Math.max(1, VENOM_GAS_FULL_DRAIN_MS);
+    player.skillCooldownUntil = Math.max(now, player.skillCooldownUntil) + DT * 1000 * drainFactor;
+    player.skillCooldownUntil = Math.min(player.skillCooldownUntil, now + cooldownMs);
     return;
   }
 
-  player.skillActiveUntil = Math.max(player.skillActiveUntil, now + SHADOW_CLOAK_REFRESH_MS);
-  player.stealthUntil = Math.max(player.stealthUntil, now + SHADOW_CLOAK_REFRESH_MS);
-
-  const drainFactor = 1 + cooldownMs / Math.max(1, SHADOW_CLOAK_FULL_DRAIN_MS);
-  player.skillCooldownUntil = Math.max(now, player.skillCooldownUntil) + DT * 1000 * drainFactor;
-  player.skillCooldownUntil = Math.min(player.skillCooldownUntil, now + cooldownMs);
+  player.skillHeld = false;
 }
 
 function stepPlayer(player: Player, now: number): boolean {
   const head = player.segments[0];
   if (!head) return true;
+
+  if (player.chronoRewindUntil > 0) {
+    if (now < player.chronoRewindUntil) {
+      stepChronoRewind(player, now);
+      return true;
+    }
+    finishChronoRewind(player);
+    return true;
+  }
+
+  // Environmental debuffs (gas / ice).
+  if (isInsideGas(head)) player.gasDebuffUntil = Math.max(player.gasDebuffUntil, now + GAS_DEBUFF_LINGER_MS);
+  if (isInsideIce(head, player.id)) player.iceSlipUntil = Math.max(player.iceSlipUntil, now + FROST_SLIP_LINGER_MS);
 
   const classCfg = classConfig(player.dna);
   const bunkered = isBunkerDownActive(player, now);
@@ -1516,6 +2038,13 @@ function stepPlayer(player: Player, now: number): boolean {
     speedMul *= 1.55;
     turnMul *= 1.15;
   }
+  if (player.skill === 'skill_eel_overdrive' && now < player.skillActiveUntil) {
+    speedMul *= 1.85;
+    turnMul *= 1.12;
+  }
+  if (now < player.iceSlipUntil) {
+    turnMul *= FROST_SLIP_TURN_MUL;
+  }
 
   const base = BASE_SPEED * classCfg.baseMul * speedMul;
   const boost = BOOST_SPEED * classCfg.boostMul * speedMul;
@@ -1527,7 +2056,8 @@ function stepPlayer(player: Player, now: number): boolean {
   const baseTurnRate = (desiredBoost ? 4.4 : 6.2) * classCfg.turnMul * turnMul; // rad/sec
   const lengthTurnFactor = clamp(1.12 - len / 260, 0.52, 1.05);
   const maxTurn = baseTurnRate * lengthTurnFactor * DT;
-  const turn = clamp(normalizeAngle(player.inputAngle - player.angle), -maxTurn, maxTurn);
+  const inputAngle = now < player.turnLockUntil ? player.angle : player.inputAngle;
+  const turn = clamp(normalizeAngle(inputAngle - player.angle), -maxTurn, maxTurn);
   player.angle = normalizeAngle(player.angle + turn);
 
   const next = { x: head.x + Math.cos(player.angle) * speed, y: head.y + Math.sin(player.angle) * speed };
@@ -1546,7 +2076,8 @@ function stepPlayer(player: Player, now: number): boolean {
   } else if (classCfg.boostDrainMul <= 0) {
     player.boostDrain = 0;
   } else {
-    player.boostDrain += BOOST_DRAIN_RATE * DT * classCfg.boostDrainMul * player.boostDrainMul;
+    const gasMul = now < player.gasDebuffUntil ? GAS_BOOST_DRAIN_MUL : 1;
+    player.boostDrain += BOOST_DRAIN_RATE * DT * classCfg.boostDrainMul * player.boostDrainMul * gasMul;
     while (player.boostDrain >= 1) {
       player.boostDrain -= 1;
       if (player.segments.length <= MIN_SEGMENTS) break;
@@ -1592,22 +2123,21 @@ function stepPlayer(player: Player, now: number): boolean {
   }
 
   // Toxic gas trail.
-  if (player.gasTrail || (player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil)) {
+  const smokescreen = player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil;
+  const venomGas = player.skill === 'skill_venom_gas' && player.skillHeld && desiredBoost;
+  if (player.gasTrail || venomGas || smokescreen) {
     player.gasAccMs += DT * 1000;
-    const interval = player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil ? 120 : GAS_DROP_INTERVAL_MS;
+    const interval = smokescreen ? 120 : venomGas ? 110 : GAS_DROP_INTERVAL_MS;
     if (player.gasAccMs >= interval) {
       player.gasAccMs = 0;
-      const base = player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil ? head : player.segments[player.segments.length - 1];
+      const base = smokescreen ? head : player.segments[player.segments.length - 1];
       if (base) {
-        const pos =
-          player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil
-            ? { x: base.x + rand(-90, 90), y: base.y + rand(-90, 90) }
-            : { x: base.x, y: base.y };
+        const pos = smokescreen ? { x: base.x + rand(-90, 90), y: base.y + rand(-90, 90) } : { x: base.x, y: base.y };
         const cloud: GasCloud = {
           id: String(nextGasId++),
           x: pos.x,
           y: pos.y,
-          r: player.skill === 'ultimate_shadow_smokescreen' && now < player.skillActiveUntil ? GAS_RADIUS * 1.2 : GAS_RADIUS,
+          r: smokescreen ? GAS_RADIUS * 1.2 : GAS_RADIUS,
           expiresAt: now + GAS_DURATION_MS + player.toxicTrailStacks * 1000,
         };
         gasClouds.set(cloud.id, cloud);
@@ -1652,6 +2182,7 @@ function stepPlayer(player: Player, now: number): boolean {
   // Apply queued growth smoothly (throttled), so food doesn't cause big one-frame length jumps.
   applyQueuedGrowth(player);
 
+  recordChronoHistory(player, now);
   trimTrail(player);
   return true;
 }
@@ -1665,39 +2196,68 @@ function tryEatFood(player: Player, now: number): void {
   const maxFoodR = FOOD_BASE_R + 3 + 2;
   let eatR = (headR + maxFoodR + 4) * classCfg.eatMul;
   if (now < player.magnetUntil) eatR *= 4;
+
+  const viperBlender = player.skill === 'skill_viper_blender' && now < player.skillActiveUntil;
+  const voidMaw = player.skill === 'skill_void_maw' && now < player.skillActiveUntil;
+  if (viperBlender) eatR *= 1.25;
+  if (voidMaw) eatR *= 1.15;
   const eatR2 = eatR * eatR;
 
   const magneticPull = player.dna === 'magnetic';
-  const pullR = magneticPull
-    ? isSingularityActive(player, now)
-      ? MAGNET_PULL_RADIUS_SINGULARITY
-      : MAGNET_PULL_RADIUS
-    : 0;
-  const pullR2 = pullR * pullR;
+  let pullR = magneticPull ? (isSingularityActive(player, now) ? MAGNET_PULL_RADIUS_SINGULARITY : MAGNET_PULL_RADIUS) : 0;
+  let pullMinSpeed = MAGNET_PULL_MIN_SPEED;
+  let pullMaxSpeed = MAGNET_PULL_MAX_SPEED;
+  let coneCos = -1;
 
-  const nearbyFoods = foodGrid.getNearby(head.x, head.y);
+  if (viperBlender) {
+    pullR = Math.max(pullR, VIPER_PULL_RADIUS);
+    pullMinSpeed = 180;
+    pullMaxSpeed = 2600;
+    coneCos = -1;
+  } else if (voidMaw) {
+    pullR = Math.max(pullR, VOID_MAW_PULL_RADIUS);
+    pullMinSpeed = 220;
+    pullMaxSpeed = 3100;
+    coneCos = Math.cos(VOID_MAW_HALF_ANGLE);
+  }
+
+  const pullR2 = pullR * pullR;
+  const forwardX = Math.cos(player.angle);
+  const forwardY = Math.sin(player.angle);
+
+  const queryR = Math.max(eatR, pullR);
+  const range = Math.max(1, Math.ceil(queryR / GRID_CELL_SIZE));
+  const nearbyFoods = foodGrid.getNearby(head.x, head.y, range);
   for (const food of nearbyFoods) {
     if (!foods.has(food.id)) continue; // may have been eaten earlier this tick
 
-    // Magnetic passive: pull nearby food toward the head before the eat check.
-    if (magneticPull && food.kind !== 'bomb') {
+    // Pull food toward the head before the eat check (magnetic passive / skin skills).
+    if (pullR > 0 && food.kind !== 'bomb') {
       const dx = head.x - food.x;
       const dy = head.y - food.y;
       const d2 = dx * dx + dy * dy;
       if (d2 > 0.001 && d2 <= pullR2) {
+        let allow = true;
         const d = Math.sqrt(d2) || 1;
-        const t = clamp(1 - d / pullR, 0, 1);
-        const strength = t * t;
-        const speed = MAGNET_PULL_MIN_SPEED + (MAGNET_PULL_MAX_SPEED - MAGNET_PULL_MIN_SPEED) * strength;
-        const step = Math.min(d, speed * DT);
+        if (coneCos > -0.99) {
+          const dot = (dx / d) * forwardX + (dy / d) * forwardY;
+          allow = dot >= coneCos;
+        }
 
-        const oldX = food.x;
-        const oldY = food.y;
-        const moved = clampToArena({ x: food.x + (dx / d) * step, y: food.y + (dy / d) * step }, food.r + 6);
-        food.x = moved.x;
-        food.y = moved.y;
-        foodGrid.remove(food, oldX, oldY);
-        foodGrid.add(food, food.x, food.y);
+        if (allow) {
+          const t = clamp(1 - d / pullR, 0, 1);
+          const strength = t * t;
+          const speed = pullMinSpeed + (pullMaxSpeed - pullMinSpeed) * strength;
+          const step = Math.min(d, speed * DT);
+
+          const oldX = food.x;
+          const oldY = food.y;
+          const moved = clampToArena({ x: food.x + (dx / d) * step, y: food.y + (dy / d) * step }, food.r + 6);
+          food.x = moved.x;
+          food.y = moved.y;
+          foodGrid.remove(food, oldX, oldY);
+          foodGrid.add(food, food.x, food.y);
+        }
       }
     }
 
@@ -1735,6 +2295,11 @@ function killPlayer(player: Player, reason: string, killerDna?: WormClass): void
   // Remove owned decoys.
   for (const [id, decoy] of decoys) {
     if (decoy.ownerId === player.id) decoys.delete(id);
+  }
+
+  // Remove owned ice zones.
+  for (const [id, zone] of iceZones) {
+    if (zone.ownerId === player.id) iceZones.delete(id);
   }
 
   // Wall crash: extra burst of pellets so it reads as an explosion.
@@ -1855,6 +2420,34 @@ function handleCollisions(now: number): void {
     }
   }
 
+  // Crimson Viper: spin knockback.
+  for (const p of list) {
+    if (p.skill !== 'skill_viper_blender') continue;
+    if (now >= p.skillActiveUntil) continue;
+    if (isPhaseActive(p, now)) continue;
+    const ph = p.segments[0];
+    if (!ph) continue;
+
+    const radius = 520;
+    const radius2 = radius * radius;
+    for (const other of list) {
+      if (other.id === p.id) continue;
+      if (toKill.has(other.id)) continue;
+      if (now - other.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
+      if (isPhaseActive(other, now)) continue;
+      if (isInvulnerableActive(other, now)) continue;
+      const oh = other.segments[0];
+      if (!oh) continue;
+      const dx = oh.x - ph.x;
+      const dy = oh.y - ph.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > radius2 || d2 === 0) continue;
+      const d = Math.sqrt(d2) || 1;
+      const strength = (1 - d / radius) * 980 * DT;
+      pushWholeWorm(other, (dx / d) * strength, (dy / d) * strength);
+    }
+  }
+
   // Head-to-head: shorter loses (or both if same length).
   for (let i = 0; i < list.length; i++) {
     const a = list[i]!;
@@ -1878,6 +2471,8 @@ function handleCollisions(now: number): void {
 
       const aSiege = isSiegeBreakerActive(a, now);
       const bSiege = isSiegeBreakerActive(b, now);
+      const aThorns = a.skill === 'skill_scarab_thorns' && now < a.skillActiveUntil;
+      const bThorns = b.skill === 'skill_scarab_thorns' && now < b.skillActiveUntil;
 
       const aLen = a.segments.length;
       const bLen = b.segments.length;
@@ -1894,6 +2489,12 @@ function handleCollisions(now: number): void {
         killA = false;
         killB = true;
       } else if (bSiege) {
+        killA = true;
+        killB = false;
+      } else if (aThorns && !bThorns) {
+        killA = false;
+        killB = true;
+      } else if (bThorns && !aThorns) {
         killA = true;
         killB = false;
       } else if (a.dna === 'shadow' || b.dna === 'shadow') {
@@ -1987,9 +2588,26 @@ function handleCollisions(now: number): void {
       const burnR2 = (collisionR * 1.55) * (collisionR * 1.55);
 
       const d2 = dist2(head, entry.seg);
+
+      // Thunder Eel: electric field breaks steering briefly.
+      if (!siege && !voidStrike && !invulnerable && other.skill === 'skill_eel_overdrive' && now < other.skillActiveUntil) {
+        const fieldR = collisionR + EEL_FIELD_RADIUS_EXTRA;
+        if (d2 <= fieldR * fieldR) {
+          player.turnLockUntil = Math.max(player.turnLockUntil, now + EEL_FIELD_STUN_MS);
+        }
+      }
+
       if (spikedStacks > 0 && !siege && !voidStrike && !invulnerable && d2 <= burnR2) {
         player.boostBurnUntil = Math.max(player.boostBurnUntil, now + 450);
         player.boostBurnStacks = Math.max(player.boostBurnStacks, spikedStacks);
+      }
+
+      // Golden Scarab: thorns kill on contact (unless you're in an unstoppable state).
+      if (!siege && !voidStrike && !invulnerable && other.skill === 'skill_scarab_thorns' && now < other.skillActiveUntil) {
+        if (d2 <= collisionR2) {
+          toKill.set(player.id, { reason: '황금 가시', killerDna: other.dna });
+          break;
+        }
       }
 
       if (d2 <= collisionR2) {
@@ -2058,13 +2676,15 @@ function buildPlayersPayload(now: number): Record<string, PlayerState> {
       color: player.color,
       boost: player.boost && player.segments.length > MIN_SEGMENTS,
       dna: player.dna,
+      skin: player.skin,
       armor: player.armor,
       stealth: isStealthActive(player, now),
       phase: isPhaseActive(player, now),
       evoStage: player.evoStage,
       nextEvoScore: player.evoStage >= 3 ? 0 : player.nextEvoScore,
-      skillCdMs: player.skill ? Math.max(0, player.skillCooldownUntil - now) : 0,
-      skillActive: player.skill ? now < player.skillActiveUntil : false,
+      skill: player.skill,
+      skillCdMs: Math.max(0, player.skillCooldownUntil - now),
+      skillActive: now < player.skillActiveUntil,
       mutations: player.mutations,
       // Use enough precision for smooth, slow movement without bloating payloads.
       segments: player.segments.map((s) => ({ x: netPos(s.x), y: netPos(s.y) })),
@@ -2084,6 +2704,7 @@ function buildDecoysPayload(): DecoyState[] {
       name: decoy.name,
       color: decoy.color,
       dna: decoy.dna,
+      skin: decoy.skin,
       originalLen: decoy.originalLen,
       segments: decoy.segments.map((s) => ({ x: netPos(s.x), y: netPos(s.y) })),
     });
@@ -2228,9 +2849,34 @@ function buildGasPayload(center: Vec2, radius: number): GasState[] {
   return out;
 }
 
+function buildIcePayload(center: Vec2, radius: number): IceState[] {
+  const out: IceState[] = [];
+  for (const zone of iceZones.values()) {
+    const dx = zone.x - center.x;
+    const dy = zone.y - center.y;
+    const rr = radius + zone.r + 280;
+    if (dx * dx + dy * dy > rr * rr) continue;
+    out.push({
+      id: zone.id,
+      ownerId: zone.ownerId,
+      x: Math.round(zone.x),
+      y: Math.round(zone.y),
+      r: zone.r,
+      expiresAt: Math.round(zone.expiresAt),
+    });
+  }
+  return out;
+}
+
 function trimGas(now: number): void {
   for (const [id, cloud] of gasClouds) {
     if (now >= cloud.expiresAt) gasClouds.delete(id);
+  }
+}
+
+function trimIceZones(now: number): void {
+  for (const [id, zone] of iceZones) {
+    if (now >= zone.expiresAt || !players.has(zone.ownerId)) iceZones.delete(id);
   }
 }
 
@@ -2280,23 +2926,30 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
   const defaultName = 'Unknown';
   let currentName = defaultName;
   let currentClass: WormClass = 'shadow';
+  let currentSkin: WormSkin = defaultSkinForClass(currentClass);
   const player = createPlayer(socket.id, currentName, { dna: currentClass });
-  const currentColor = player.color;
+  let currentColor = player.color;
+  currentSkin = player.skin;
   players.set(socket.id, player);
 
   socket.emit('welcome', { id: socket.id, world: WORLD, tickRate: TICK_RATE });
 
-  socket.on('join', ({ name, dna }) => {
+  socket.on('join', ({ name, dna, skin }) => {
     const p = players.get(socket.id);
     if (!p) return;
     currentName = sanitizeName(name);
-    currentClass = sanitizeClass(dna);
+
+    const fallbackClass = sanitizeClass(dna);
+    const requestedSkin = typeof skin === 'string' ? sanitizeSkin(skin) : defaultSkinForClass(fallbackClass);
+    currentSkin = requestedSkin;
+    currentClass = classForSkin(requestedSkin);
+    currentColor = randomColorForSkin(requestedSkin);
     p.name = currentName;
 
     const canApplyNow =
       p.score === START_MASS && p.evoStage === 0 && Date.now() - p.spawnedAt < SPAWN_INVULNERABLE_MS + 1200;
     if (canApplyNow) {
-      resetPlayerForLobbyChoice(p, currentClass);
+      resetPlayerForLobbyChoice(p, currentClass, currentSkin, currentColor);
     }
   });
 
@@ -2331,8 +2984,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
   socket.on('respawn', () => {
     if (players.has(socket.id)) return;
-    const p = createPlayer(socket.id, currentName, { dna: currentClass });
-    p.color = currentColor;
+    const p = createPlayer(socket.id, currentName, { dna: currentClass, skin: currentSkin, color: currentColor });
     players.set(socket.id, p);
   });
 
@@ -2357,10 +3009,12 @@ for (let i = 0; i < BOT_COUNT; i++) {
   const id = `bot-${i + 1}`;
   const r = Math.random();
   const dna: WormClass = r < 0.34 ? 'iron' : r < 0.67 ? 'shadow' : 'magnetic';
+  const skin = randomSkinForClass(dna);
   botProfiles.set(id, {
     name: 'Unknown',
-    color: randomClassColor(dna),
+    color: randomColorForSkin(skin),
     dna,
+    skin,
   });
   players.set(id, initBot(id));
 }
@@ -2368,11 +3022,23 @@ for (let i = 0; i < BOT_COUNT; i++) {
 setInterval(() => {
   const now = Date.now();
 
+  // Trim transient entities.
+  trimGas(now);
+  trimIceZones(now);
+
   // Rebuild spatial grids for this tick.
   foodGrid.clear();
   playerGrid.clear();
+  gasGrid.clear();
+  iceGrid.clear();
   for (const food of foods.values()) {
     foodGrid.add(food, food.x, food.y);
+  }
+  for (const cloud of gasClouds.values()) {
+    gasGrid.add(cloud, cloud.x, cloud.y);
+  }
+  for (const zone of iceZones.values()) {
+    iceGrid.add(zone, zone.x, zone.y);
   }
 
   for (const player of players.values()) {
@@ -2384,6 +3050,9 @@ setInterval(() => {
     maybeOfferMutation(player, now);
   }
 
+  stepDecoys(now);
+  stepPlasmaRays(now);
+
   stepBlackHoles(now);
   handleCollisions(now);
   trimDecoys(now);
@@ -2391,6 +3060,7 @@ setInterval(() => {
   spawnFoodsUpToCap();
   trimFoods();
   trimGas(now);
+  trimIceZones(now);
 
   const playersOut = buildPlayersPayload(now);
   const decoysOut = buildDecoysPayload();
@@ -2414,6 +3084,7 @@ setInterval(() => {
       decoys: decoysOut,
       foods: buildFoodsPayload(center, foodRadius),
       gas: buildGasPayload(center, foodRadius),
+      ice: buildIcePayload(center, foodRadius),
       blackHoles: blackHolesOut,
       leaderboard,
     });
