@@ -52,6 +52,11 @@ type PlayerRender = {
   ownerId?: string;
   spawnFx: number;
   eatFx: number;
+  heading: number;
+  headingValid: boolean;
+  bank: number;
+  scarf?: THREE.Mesh;
+  magicCircle?: THREE.Mesh;
   visualLen: number;
   tailTip?: Vec2f;
   skinSeed: number;
@@ -90,8 +95,18 @@ const SINGULARITY_MAX_RANGE = 1400;
 // Camera zoom rules:
 // - Higher zoom = closer (less FOV), lower zoom = farther (more FOV)
 // - "Min zoom" acts as a zoom-out cap (max view range)
-const CAMERA_BASE_MIN_ZOOM = 0.58; // Max zoom-out without Eagle Eye (narrower view)
-const CAMERA_ABS_MIN_ZOOM = 0.46; // Hard zoom-out cap (even with Eagle Eye)
+const CAMERA_BASE_MIN_ZOOM = 0.8; // Max zoom-out without Eagle Eye (narrower view)
+const CAMERA_ABS_MIN_ZOOM = 0.68; // Hard zoom-out cap (even with Eagle Eye)
+
+// Banking (flight-sim feel): roll the camera/worm into turns based on turn rate (rad/sec).
+// NOTE: Camera roll is intentionally kept near-zero for comfort (avoid motion sickness).
+const CAMERA_BANK_MAX = 0.0; // radians
+const CAMERA_BANK_TURN_RATE_FOR_MAX = 4.2;
+const CAMERA_BANK_K = 10;
+
+const WORM_BANK_MAX = 0.35; // radians (~20°)
+const WORM_BANK_TURN_RATE_FOR_MAX = 4.6;
+const WORM_BANK_K = 12;
 
 const CLASS_ORDER: WormClass[] = ['iron', 'shadow', 'magnetic'];
 
@@ -101,17 +116,17 @@ const CLASS_META: Record<
 > = {
   iron: {
     title: 'Iron Worm',
-    desc: 'Tank · Titan Plating(정면충돌 2회 방어) · 중장비 갑각/스파크. Stage2: Bunker Down(E) / Stage3: Siege Breaker.',
+    desc: 'Tank · Full Metal(겹겹이 중장갑/갑옷판) · Titan Plating(정면충돌 2회 방어). Stage2: Bunker Down(E) / Stage3: Siege Breaker.',
     stats: { defense: 0.95, speed: 0.42, farm: 0.48 },
   },
   shadow: {
     title: 'Shadow Snake',
-    desc: 'Assassin · Optical Cloak(홀드 은신/게이지) · 네온/잔상 에너지체. Stage2: Optical Cloak(Hold E) / Stage3: Void Strike.',
+    desc: 'Assassin · Cyber Ninja(매끈 바디슈트+에너지 스카프) · Optical Cloak(홀드 은신/게이지). Stage2: Optical Cloak(Hold E) / Stage3: Void Strike.',
     stats: { defense: 0.32, speed: 0.96, farm: 0.58 },
   },
   magnetic: {
     title: 'Magnetic Slug',
-    desc: 'Farmer · Graviton Maw(먹이 흡입 3x) · 중력장/블랙홀 컨셉. Stage2: Hyper-Metabolism / Stage3: Singularity(드래그 조준).',
+    desc: 'Mage · Arcana/Cosmic(별자리 바디+회전 마법진) · 블랙홀 컨셉. Stage2: Hyper-Metabolism / Stage3: Singularity(드래그 조준).',
     stats: { defense: 0.46, speed: 0.56, farm: 0.95 },
   },
 };
@@ -905,6 +920,152 @@ function createSoftCircleTexture(): THREE.CanvasTexture {
   return texture;
 }
 
+function createGlowCircleTexture(): THREE.CanvasTexture {
+  const size = 128;
+  const dpr = Math.min(window.devicePixelRatio ?? 1, 2);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(size * dpr);
+  canvas.height = Math.round(size * dpr);
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context를 만들 수 없습니다.');
+  ctx.scale(dpr, dpr);
+
+  ctx.clearRect(0, 0, size, size);
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = size / 2;
+
+  const grad = ctx.createRadialGradient(cx, cy, r * 0.02, cx, cy, r);
+  grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+  grad.addColorStop(0.22, 'rgba(255, 255, 255, 0.85)');
+  grad.addColorStop(0.55, 'rgba(255, 255, 255, 0.22)');
+  grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  return texture;
+}
+
+function createRuneCircleTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const dpr = Math.min(window.devicePixelRatio ?? 1, 2);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(size * dpr);
+  canvas.height = Math.round(size * dpr);
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context를 만들 수 없습니다.');
+  ctx.scale(dpr, dpr);
+
+  ctx.clearRect(0, 0, size, size);
+  ctx.translate(size / 2, size / 2);
+
+  const r = size * 0.42;
+
+  // Base glow ring
+  const glow = ctx.createRadialGradient(0, 0, r * 0.55, 0, 0, r * 1.12);
+  glow.addColorStop(0, 'rgba(255, 255, 255, 0)');
+  glow.addColorStop(0.65, 'rgba(255, 255, 255, 0.08)');
+  glow.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 1.12, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer & inner rings
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.32)';
+  ctx.lineWidth = 10;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 1.02, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.92, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.64, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Rune glyphs around the ring
+  const runeCount = 28;
+  for (let i = 0; i < runeCount; i++) {
+    const a = (i / runeCount) * Math.PI * 2;
+    ctx.save();
+    ctx.rotate(a);
+    ctx.translate(0, -r * 0.9);
+
+    const w = 10 + (i % 3) * 3;
+    const h = 16 + (i % 4) * 2;
+    const slant = (i % 2 === 0 ? 1 : -1) * (0.2 + (i % 5) * 0.03);
+    ctx.rotate(slant);
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.78)';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.45, h * 0.35);
+    ctx.lineTo(-w * 0.1, -h * 0.45);
+    ctx.lineTo(w * 0.35, h * 0.2);
+    ctx.stroke();
+
+    // Little "dot" accent
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.beginPath();
+    ctx.arc(w * 0.25, -h * 0.25, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // Radial tick marks
+  const tickCount = 56;
+  for (let i = 0; i < tickCount; i++) {
+    const a = (i / tickCount) * Math.PI * 2;
+    const major = i % 7 === 0;
+    const inner = major ? r * 0.68 : r * 0.73;
+    const outer = major ? r * 0.82 : r * 0.8;
+    ctx.strokeStyle = major ? 'rgba(255, 255, 255, 0.35)' : 'rgba(255, 255, 255, 0.18)';
+    ctx.lineWidth = major ? 2.2 : 1.2;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * inner, Math.sin(a) * inner);
+    ctx.lineTo(Math.cos(a) * outer, Math.sin(a) * outer);
+    ctx.stroke();
+  }
+
+  // Subtle star speckles
+  for (let i = 0; i < 120; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const rr = r * (0.25 + Math.random() * 0.85);
+    const x = Math.cos(a) * rr;
+    const y = Math.sin(a) * rr;
+    const rad = 0.6 + Math.random() * 1.4;
+    const alpha = 0.04 + Math.random() * 0.08;
+    ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+    ctx.beginPath();
+    ctx.arc(x, y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  return texture;
+}
+
 function createWorldGrid(world: WorldConfig, maxAnisotropy: number): THREE.Group {
   const layer = new THREE.Group();
   const radius = world.width / 2;
@@ -929,28 +1090,32 @@ function createWorldGrid(world: WorldConfig, maxAnisotropy: number): THREE.Group
 
   const borderMat = new THREE.MeshBasicMaterial({
     color: 0xffffff,
-    transparent: true,
-    opacity: 1,
     side: THREE.DoubleSide,
-    depthWrite: false,
   });
+  // Opaque + polygonOffset to avoid z-fighting flicker against the ground at large world scales.
+  borderMat.polygonOffset = true;
+  borderMat.polygonOffsetFactor = -2;
+  borderMat.polygonOffsetUnits = -2;
   const border = new THREE.Mesh(new THREE.RingGeometry(radius - 12, radius + 12, 144), borderMat);
   border.rotation.x = -Math.PI / 2;
-  border.position.y = 0.25;
+  border.position.y = 0.65;
+  border.renderOrder = 2;
   border.name = 'border';
 
   const outsideMat = new THREE.MeshBasicMaterial({
     color: 0x0d0f14,
-    transparent: true,
-    opacity: 1,
     side: THREE.DoubleSide,
-    depthWrite: false,
   });
+  outsideMat.polygonOffset = true;
+  outsideMat.polygonOffsetFactor = -1;
+  outsideMat.polygonOffsetUnits = -1;
   const outside = new THREE.Mesh(new THREE.RingGeometry(radius + 12, radius + 5200, 144), outsideMat);
   outside.rotation.x = -Math.PI / 2;
-  outside.position.y = 0.2;
+  outside.position.y = 0.6;
+  outside.renderOrder = 1;
   outside.name = 'outside';
 
+  ground.renderOrder = 0;
   layer.add(ground, outside, border);
 
   return layer;
@@ -1095,8 +1260,9 @@ function spawnEatSuction(particles: Particle[], from: Vec2f, to: Vec2f, color: n
   const ny = dy / dist;
   const px = -ny;
   const py = nx;
-  const count = Math.round(clamp(4 + value * 2, 4, 10));
-  const speedBase = clamp(900 + dist * 0.9, 900, 2100);
+  const magnetic = dna === 'magnetic';
+  const count = Math.round(clamp((magnetic ? 6 : 4) + value * 2, 4, magnetic ? 14 : 10));
+  const speedBase = clamp(900 + dist * 0.9, 900, 2100) * (magnetic ? 1.12 : 1);
 
   for (let i = 0; i < count; i++) {
     const spread = rand(0, 18 + value * 8);
@@ -1109,8 +1275,8 @@ function spawnEatSuction(particles: Particle[], from: Vec2f, to: Vec2f, color: n
       kind: 'dot',
       x: start.x,
       y: start.y,
-      vx: nx * speed,
-      vy: ny * speed,
+      vx: nx * speed + (magnetic ? px * (rand(-1, 1) * speed * (0.12 + value * 0.03)) : 0),
+      vy: ny * speed + (magnetic ? py * (rand(-1, 1) * speed * (0.12 + value * 0.03)) : 0),
       r: rand(1.6, 3.1) + value * 0.15,
       life,
       maxLife: life,
@@ -1120,7 +1286,7 @@ function spawnEatSuction(particles: Particle[], from: Vec2f, to: Vec2f, color: n
   }
 
   // A few sharper streaks for readability.
-  const streaks = Math.round(clamp(1 + value * 0.8, 1, 3));
+  const streaks = Math.round(clamp((magnetic ? 2 : 1) + value * 0.8, magnetic ? 2 : 1, magnetic ? 4 : 3));
   const ang = Math.atan2(ny, nx);
   for (let i = 0; i < streaks; i++) {
     const speed = speedBase * rand(0.9, 1.25);
@@ -1285,6 +1451,7 @@ async function main() {
   const classNameEl = document.getElementById('className');
   const classDescEl = document.getElementById('classDesc');
   const classRecommendEl = document.getElementById('classRecommend');
+  const classPanelEl = document.getElementById('classPanel');
   const classRadarEl = document.getElementById('classRadar') as HTMLCanvasElement | null;
   const classSwipeAreaEl = document.getElementById('classSwipeArea');
   const nameInputEl = document.getElementById('nameInput') as HTMLInputElement | null;
@@ -1300,6 +1467,8 @@ async function main() {
   const mutationStageEl = document.getElementById('mutationStage');
   const mutationCardsEl = document.getElementById('mutationCards');
   const sixthSenseEl = document.getElementById('sixthSense');
+  const bestScoreEl = document.getElementById('bestScore');
+  const lastScoreEl = document.getElementById('lastScore');
 
   if (
     !uiRootEl ||
@@ -1313,6 +1482,7 @@ async function main() {
     !classNameEl ||
     !classDescEl ||
     !classRecommendEl ||
+    !classPanelEl ||
     !classRadarEl ||
     !classSwipeAreaEl ||
     !nameInputEl ||
@@ -1343,6 +1513,7 @@ async function main() {
   const className = classNameEl as HTMLDivElement;
   const classDesc = classDescEl as HTMLDivElement;
   const classRecommend = classRecommendEl as HTMLDivElement;
+  const classPanel = classPanelEl as HTMLDivElement;
   const classRadar = classRadarEl as HTMLCanvasElement;
   const classSwipeArea = classSwipeAreaEl as HTMLDivElement;
   const nameInput = nameInputEl as HTMLInputElement;
@@ -1362,6 +1533,8 @@ async function main() {
   const mutationStage = mutationStageEl as HTMLDivElement;
   const mutationCards = mutationCardsEl as HTMLDivElement;
   const sixthSense = sixthSenseEl as HTMLDivElement;
+  const bestScoreText = bestScoreEl as HTMLDivElement | null;
+  const lastScoreText = lastScoreEl as HTMLDivElement | null;
   let minimapAcc = 0;
 
   const storedName = localStorage.getItem('mewdle_name');
@@ -1371,6 +1544,23 @@ async function main() {
     classSelect.value = storedClass;
   }
 
+  const BEST_SCORE_KEY = 'mewdle_bestScore';
+  const LAST_SCORE_KEY = 'mewdle_lastScore';
+
+  const readStoredScore = (key: string): number => {
+    const raw = localStorage.getItem(key);
+    if (!raw) return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  const renderMenuStats = (): void => {
+    if (bestScoreText) bestScoreText.textContent = formatScore(readStoredScore(BEST_SCORE_KEY));
+    if (lastScoreText) lastScoreText.textContent = formatScore(readStoredScore(LAST_SCORE_KEY));
+  };
+
+  renderMenuStats();
+
   // Lobby class UI
   const todayPick = recommendedClassForToday();
   classRecommend.textContent = `오늘의 추천 클래스: ${titleForClass(todayPick)} (+10% Bonus)`;
@@ -1378,6 +1568,26 @@ async function main() {
   const clampClass = (dna: WormClass): WormClass => (CLASS_ORDER.includes(dna) ? dna : 'shadow');
 
   let lobbyClass: WormClass = clampClass((classSelect.value as WormClass) || 'shadow');
+  const LOBBY_PREVIEW_ID = '__lobby_preview__';
+  let lobbyPreviewRender: PlayerRender | undefined;
+  const LOBBY_PREVIEW_SEGMENTS = 72;
+  const lobbyPreviewPose: Vec2[] = Array.from({ length: LOBBY_PREVIEW_SEGMENTS }, () => ({ x: 0, y: 0 }));
+
+  const lobbyPreviewColorFor = (dna: WormClass): number =>
+    dna === 'iron' ? 0xffb15a : dna === 'shadow' ? 0x00e5ff : 0x8cff00;
+
+  const applyLobbyPreviewStyle = (): void => {
+    if (!lobbyPreviewRender) return;
+    lobbyPreviewRender.dna = lobbyClass;
+    lobbyPreviewRender.color = lobbyPreviewColorFor(lobbyClass);
+    lobbyPreviewRender.name = '';
+    lobbyPreviewRender.mutations = [];
+    lobbyPreviewRender.armor = lobbyClass === 'iron' ? 2 : 0;
+    lobbyPreviewRender.stealth = false;
+    lobbyPreviewRender.phase = false;
+    lobbyPreviewRender.skillActive = false;
+    lobbyPreviewRender.boosting = lobbyClass !== 'iron';
+  };
 
   const updateLobby = (dna: WormClass, persist = true): void => {
     lobbyClass = clampClass(dna);
@@ -1385,64 +1595,93 @@ async function main() {
     className.textContent = titleForClass(lobbyClass);
     classDesc.textContent = descForClass(lobbyClass);
 
-    const accent =
-      lobbyClass === 'iron'
-        ? 'rgba(224, 123, 57, 0.95)'
-        : lobbyClass === 'shadow'
-          ? 'rgba(0, 229, 255, 0.95)'
-          : 'rgba(140, 255, 0, 0.95)';
+    const accentRgb =
+      lobbyClass === 'iron' ? '224, 123, 57' : lobbyClass === 'shadow' ? '0, 229, 255' : '140, 255, 0';
+    const accent = `rgba(${accentRgb}, 0.95)`;
+    menu.style.setProperty('--accent', accent);
+    menu.style.setProperty('--accent-soft', `rgba(${accentRgb}, 0.18)`);
+    menu.style.setProperty('--accent-border', `rgba(${accentRgb}, 0.28)`);
     drawHexRadar(classRadarCtx, CLASS_META[lobbyClass].stats, accent);
 
     if (persist) localStorage.setItem('mewdle_class', lobbyClass);
+    applyLobbyPreviewStyle();
   };
 
   updateLobby(lobbyClass, false);
+
+  let lobbySwapTimer: number | undefined;
+  const triggerLobbySwap = (dir: -1 | 1): void => {
+    classPanel.dataset.dir = dir === 1 ? 'next' : 'prev';
+    classPanel.classList.remove('swap');
+    // Restart keyframes reliably.
+    void classPanel.offsetWidth;
+    classPanel.classList.add('swap');
+    if (lobbyPreviewRender) lobbyPreviewRender.spawnFx = Math.max(lobbyPreviewRender.spawnFx, 0.22);
+    if (lobbySwapTimer) window.clearTimeout(lobbySwapTimer);
+    lobbySwapTimer = window.setTimeout(() => classPanel.classList.remove('swap'), 820);
+  };
 
   const stepLobby = (dir: -1 | 1): void => {
     const idx = Math.max(0, CLASS_ORDER.indexOf(lobbyClass));
     const next = (idx + dir + CLASS_ORDER.length) % CLASS_ORDER.length;
     updateLobby(CLASS_ORDER[next] ?? 'shadow');
+    triggerLobbySwap(dir);
   };
 
   classPrev.addEventListener('click', () => stepLobby(-1));
   classNext.addEventListener('click', () => stepLobby(1));
 
-  let swipePointerId: number | undefined;
-  let swipeStartX: number | undefined;
-  classSwipeArea.addEventListener('pointerdown', (e) => {
-    const target = e.target as HTMLElement | null;
-    if (target?.closest('button')) return; // Don't break arrow clicks (pointer capture would swallow click).
+  const menuLeft = menu.querySelector('.menu-left') as HTMLDivElement | null;
 
-    swipePointerId = e.pointerId;
-    swipeStartX = e.clientX;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-  });
-  classSwipeArea.addEventListener('pointerup', (e) => {
-    if (swipePointerId !== e.pointerId) return;
-    if (swipeStartX === undefined) return;
-    const dx = e.clientX - swipeStartX;
+  const bindLobbySwipe = (el: HTMLElement): void => {
+    let swipePointerId: number | undefined;
+    let swipeStartX: number | undefined;
 
-    swipePointerId = undefined;
-    swipeStartX = undefined;
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      // ignore
-    }
+    el.addEventListener('pointerdown', (e) => {
+      if (menu.classList.contains('hidden')) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('button, input, select, textarea')) return;
 
-    if (Math.abs(dx) < 24) return;
-    stepLobby(dx > 0 ? -1 : 1);
-  });
-  classSwipeArea.addEventListener('pointercancel', (e) => {
-    if (swipePointerId !== e.pointerId) return;
-    swipePointerId = undefined;
-    swipeStartX = undefined;
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      // ignore
-    }
-  });
+      swipePointerId = e.pointerId;
+      swipeStartX = e.clientX;
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    });
+
+    el.addEventListener('pointerup', (e) => {
+      if (swipePointerId !== e.pointerId) return;
+      if (swipeStartX === undefined) return;
+      const dx = e.clientX - swipeStartX;
+
+      swipePointerId = undefined;
+      swipeStartX = undefined;
+      try {
+        el.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+
+      if (Math.abs(dx) < 24) return;
+      stepLobby(dx > 0 ? -1 : 1);
+    });
+
+    el.addEventListener('pointercancel', (e) => {
+      if (swipePointerId !== e.pointerId) return;
+      swipePointerId = undefined;
+      swipeStartX = undefined;
+      try {
+        el.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    });
+  };
+
+  bindLobbySwipe(classSwipeArea);
+  if (menuLeft) bindLobbySwipe(menuLeft);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, 2));
@@ -1464,6 +1703,12 @@ async function main() {
   const world = new THREE.Group();
   scene.add(world);
 
+  // Build a default world grid immediately so the lobby has a nice backdrop.
+  // (The server will send the authoritative size in `welcome`, but this project uses a fixed world size anyway.)
+  const initialGrid = createWorldGrid({ width: 16000, height: 16000 }, renderer.capabilities.getMaxAnisotropy());
+  initialGrid.name = 'grid';
+  world.add(initialGrid);
+
   // Lighting tuned for "MOBA-ish" readability (clear silhouettes + grounded scene).
   const hemi = new THREE.HemisphereLight(0x86a1ff, 0x07080c, 0.48);
   const key = new THREE.DirectionalLight(0xffffff, 1.05);
@@ -1476,17 +1721,46 @@ async function main() {
   const tmpColor = new THREE.Color();
   const tmpDir = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
+  const tmpQuat = new THREE.Quaternion();
 
   const FOOD_MAX_INST = 2400;
   const foodGeometry = new THREE.SphereGeometry(1, 12, 12);
   ensureVertexColorOnes(foodGeometry);
+  const foodGlowTexture = createGlowCircleTexture();
+  foodGlowTexture.colorSpace = THREE.SRGBColorSpace;
+
+  const foodGlowGeometry = new THREE.CircleGeometry(1, 32);
+  foodGlowGeometry.rotateX(-Math.PI / 2);
+  ensureVertexColorOnes(foodGlowGeometry);
+
+  const foodGlowMesh = new THREE.InstancedMesh(
+    foodGlowGeometry,
+    new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0xffffff,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.75,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    }),
+    FOOD_MAX_INST,
+  );
+  // Ensure instance colors exist; otherwise vertex colors default to black in WebGL.
+  foodGlowMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(FOOD_MAX_INST * 3), 3);
+  foodGlowMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  foodGlowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  foodGlowMesh.frustumCulled = false;
+  foodGlowMesh.count = 0;
+  foodGlowMesh.renderOrder = 2;
+  world.add(foodGlowMesh);
+
   const foodMesh = new THREE.InstancedMesh(
     foodGeometry,
     new THREE.MeshBasicMaterial({
       color: 0xffffff,
       vertexColors: true,
-      transparent: true,
-      opacity: 0.98,
       toneMapped: false,
     }),
     FOOD_MAX_INST,
@@ -1497,6 +1771,7 @@ async function main() {
   foodMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   foodMesh.frustumCulled = false;
   foodMesh.count = 0;
+  foodMesh.renderOrder = 3;
   world.add(foodMesh);
 
   const GAS_MAX_INST = 800;
@@ -1588,6 +1863,22 @@ async function main() {
   let serverConfig: WelcomePayload | undefined;
 
   let foods: FoodState[] = [];
+type FoodVisual = {
+  id: string;
+  x: number;
+  y: number;
+  tx: number;
+  ty: number;
+  r: number;
+  tr: number;
+  color: number;
+  value: number;
+  present: boolean;
+  alpha: number;
+  sucked: boolean;
+  suckLift: number;
+};
+  const foodVisuals = new Map<string, FoodVisual>();
   let prevFoodMap = new Map<string, FoodState>();
   const playerRenders = new Map<string, PlayerRender>();
   const decoyRenders = new Map<string, PlayerRender>();
@@ -1622,6 +1913,100 @@ async function main() {
   ensureVertexColorOnes(wormBodyTriGeometry);
   ensureVertexColorOnes(wormSpineGeometry);
   const auraGeometry = new THREE.RingGeometry(0.84, 1.0, 72);
+
+  const runeTexture = createRuneCircleTexture();
+  runeTexture.colorSpace = THREE.SRGBColorSpace;
+
+  const magicCircleGeometry = new THREE.RingGeometry(0.78, 1.12, 96);
+  magicCircleGeometry.rotateX(-Math.PI / 2);
+
+  const SCARF_WIDTH = 1.35;
+  const SCARF_LENGTH = 9.2;
+  const SCARF_SEGMENTS = 22;
+
+  const createScarfMesh = (): THREE.Mesh => {
+    const geo = new THREE.PlaneGeometry(SCARF_WIDTH, SCARF_LENGTH, 6, SCARF_SEGMENTS);
+    geo.rotateX(-Math.PI / 2);
+    geo.translate(0, 0, -SCARF_LENGTH / 2);
+    const pos = geo.getAttribute('position') as THREE.BufferAttribute | null;
+    if (pos) {
+      geo.userData.basePos = new Float32Array(pos.array as Float32Array);
+      geo.userData.len = SCARF_LENGTH;
+    }
+
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x00e5ff,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 2;
+    mesh.visible = false;
+    return mesh;
+  };
+
+  const createMagicCircleMesh = (): THREE.Mesh => {
+    const mat = new THREE.MeshBasicMaterial({
+      map: runeTexture,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const mesh = new THREE.Mesh(magicCircleGeometry, mat);
+    mesh.renderOrder = 1;
+    mesh.visible = false;
+    return mesh;
+  };
+
+  const animateScarf = (mesh: THREE.Mesh, t: number, seed: number, intensity: number): void => {
+    const geo = mesh.geometry as THREE.BufferGeometry;
+    const pos = geo.getAttribute('position') as THREE.BufferAttribute | undefined;
+    const base = geo.userData.basePos as Float32Array | undefined;
+    const len = (geo.userData.len as number | undefined) ?? SCARF_LENGTH;
+    if (!pos || !base) return;
+
+    const arr = pos.array as Float32Array;
+    const speed = 7.6 + intensity * 7.2;
+    const sideAmp = 0.12 + intensity * 0.28;
+    const liftAmp = 0.14 + intensity * 0.24;
+    const curlAmp = 0.08 + intensity * 0.22;
+    const flickerAmp = 0.03 + intensity * 0.07;
+    const halfW = SCARF_WIDTH / 2;
+    for (let i = 0; i < pos.count; i++) {
+      const bi = i * 3;
+      const bx = base[bi + 0] ?? 0;
+      const by = base[bi + 1] ?? 0;
+      const bz = base[bi + 2] ?? 0;
+
+      const f = clamp(-bz / len, 0, 1);
+      const env = f * f;
+      const xNorm = halfW > 0 ? clamp(bx / halfW, -1, 1) : 0;
+      const edge = Math.abs(xNorm);
+      const edgeEnv = edge * edge;
+
+      const phase = t * speed + bz * 2.25 + seed * 11.2;
+      const flame = Math.sin(phase + xNorm * 1.6 + Math.sin(phase * 1.7) * 0.35) * sideAmp * env;
+      const curl = Math.sin(t * (3.0 + intensity * 1.2) + bz * 3.6 + seed * 7.0) * xNorm * curlAmp * env * (0.5 + edgeEnv);
+      const flicker = Math.sin(t * (11.0 + intensity * 8.0) + bz * 5.2 + seed * 13.0 + bx * 4.0) * flickerAmp * env;
+
+      const lift = (0.4 + 0.6 * Math.sin(phase * 1.1 + seed * 2.0)) * liftAmp * env;
+      const flutter = Math.sin(phase * 0.6 + bx * 3.0 + seed * 1.7) * (0.06 + intensity * 0.08) * env;
+
+      arr[bi + 0] = bx + flame + curl + flicker;
+      arr[bi + 1] = by + lift + flutter;
+      arr[bi + 2] = bz;
+    }
+    pos.needsUpdate = true;
+  };
 
   const shadowGeometry = new THREE.CircleGeometry(1, 42);
   shadowGeometry.rotateX(-Math.PI / 2);
@@ -1745,6 +2130,9 @@ async function main() {
     const head = new THREE.Group();
     head.renderOrder = 4;
 
+    const scarf = createScarfMesh();
+    const magicCircle = createMagicCircleMesh();
+
     const shadowMat = shadowMaterialBase.clone();
     const shadow = new THREE.Mesh(shadowGeometry, shadowMat);
     shadow.position.y = 0.02;
@@ -1772,13 +2160,15 @@ async function main() {
 
     group.add(shadow);
     group.add(aura);
+    group.add(magicCircle);
+    group.add(scarf);
     group.add(spine);
     group.add(body);
     group.add(head);
     group.add(nameSprite);
 
     const seed = hashString32(id);
-    const render: PlayerRender = {
+  const render: PlayerRender = {
       group,
       body,
       spine,
@@ -1804,6 +2194,11 @@ async function main() {
       isDecoy: false,
       spawnFx: 1,
       eatFx: 0,
+      heading: 0,
+      headingValid: false,
+      bank: 0,
+      scarf,
+      magicCircle,
       visualLen: 0,
       skinSeed: seed,
       skinPalette: [],
@@ -1817,6 +2212,13 @@ async function main() {
     playerRenders.set(id, render);
     return render;
   }
+
+  // Lobby 3D preview worm (uses the same rendering pipeline, but is never driven by server state).
+  lobbyPreviewRender = ensurePlayerRender(LOBBY_PREVIEW_ID);
+  lobbyPreviewRender.group.name = 'lobbyPreview';
+  lobbyPreviewRender.spawnFx = 0;
+  lobbyPreviewRender.nameSprite.visible = false;
+  applyLobbyPreviewStyle();
 
   function ensureDecoyRender(id: string): PlayerRender {
     const existing = decoyRenders.get(id);
@@ -1869,6 +2271,9 @@ async function main() {
     const head = new THREE.Group();
     head.renderOrder = 4;
 
+    const scarf = createScarfMesh();
+    const magicCircle = createMagicCircleMesh();
+
     const shadowMat = shadowMaterialBase.clone();
     const shadow = new THREE.Mesh(shadowGeometry, shadowMat);
     shadow.position.y = 0.02;
@@ -1896,6 +2301,8 @@ async function main() {
 
     group.add(shadow);
     group.add(aura);
+    group.add(magicCircle);
+    group.add(scarf);
     group.add(spine);
     group.add(body);
     group.add(head);
@@ -1929,6 +2336,11 @@ async function main() {
       ownerId: undefined,
       spawnFx: 0.5,
       eatFx: 0,
+      heading: 0,
+      headingValid: false,
+      bank: 0,
+      scarf,
+      magicCircle,
       visualLen: 0,
       skinSeed: seed,
       skinPalette: [],
@@ -1962,36 +2374,32 @@ async function main() {
   magneticMouthGeometry.translate(0, 0, 0.9);
   const magneticMouthDiscGeometry = new THREE.CircleGeometry(0.55, 24);
   magneticMouthDiscGeometry.translate(0, 0, 1.05);
+  const arcanaOrbGeometry = new THREE.SphereGeometry(0.92, 22, 16);
+  const arcanaRingGeometry = new THREE.TorusGeometry(1.2, 0.07, 10, 40);
+  arcanaRingGeometry.rotateX(Math.PI / 2);
 
   function buildSkin(dna: WormClass, seed: number, baseColor: number): { palette: number[]; stripe: number } {
-    const base = hexToHsl(baseColor);
     const seedJitter = (((seed >>> 0) & 0xff) / 255 - 0.5) * 0.08;
-    const idHue = (base.h + seedJitter + 1) % 1;
 
     if (dna === 'iron') {
-      const accent = hslToHex(idHue, 0.92, 0.6);
-      const accent2 = hslToHex((idHue + 0.02) % 1, 0.9, 0.52);
-      const gun1 = 0x2c3642;
-      const gun2 = 0x3a4656;
-      const steel = 0x9fb0bf;
-      return { palette: [gun1, accent, gun2, accent2, steel, accent, gun2, accent2], stripe: 6 };
+      const whiteSteel = 0xf0f4f8;
+      const darkJoint = 0x2b303b;
+      const accent = mixColor(0xffd700, baseColor, 0.55 + seedJitter * 0.5);
+      return { palette: [whiteSteel, whiteSteel, darkJoint, whiteSteel, accent, darkJoint], stripe: 4 };
     }
 
     if (dna === 'shadow') {
-      const cyan = hslToHex(0.52 + seedJitter * 0.5, 0.96, 0.56);
-      const violet = hslToHex(0.78 + seedJitter * 0.5, 0.96, 0.56);
-      const idNeon = hslToHex(idHue, 0.96, 0.58);
-      const darkNeon = hslToHex(idHue, 0.8, 0.22);
-      return { palette: [cyan, violet, idNeon, darkNeon, violet, cyan], stripe: 7 };
+      const matBlack = 0x111111;
+      const neon1 = mixColor(baseColor, 0x00e5ff, 0.55 + seedJitter * 0.4);
+      const neon2 = mixColor(baseColor, 0xb000ff, 0.55 - seedJitter * 0.4);
+      return { palette: [matBlack, matBlack, matBlack, neon1, matBlack, neon2], stripe: 8 };
     }
 
     // magnetic
-    const hueShift = (idHue - 0.5) * 0.08;
-    const green = hslToHex(0.3 + hueShift + seedJitter * 0.4, 0.95, 0.5);
-    const lime = hslToHex(0.26 + hueShift + seedJitter * 0.4, 0.95, 0.55);
-    const yellow = hslToHex(0.15 + hueShift * 0.35 + seedJitter * 0.35, 0.95, 0.6);
-    const purple = hslToHex(0.76 + seedJitter * 0.3, 0.75, 0.56);
-    return { palette: [green, lime, yellow, lime, green, purple], stripe: 8 };
+    const cosmicBlue = 0x191970;
+    const starLight = 0xe0ffff;
+    const nebula = mixColor(0xff007f, baseColor, 0.4 + seedJitter * 0.35);
+    return { palette: [cosmicBlue, cosmicBlue, nebula, cosmicBlue, starLight, nebula], stripe: 10 };
   }
 
   function clearHead(render: PlayerRender): void {
@@ -2005,14 +2413,15 @@ async function main() {
     render.styleDna = render.dna;
     render.styleColor = render.color;
 
-    render.body.geometry =
-      render.dna === 'iron' ? wormBodyHexGeometry : render.dna === 'shadow' ? wormBodyTriGeometry : wormBodyRoundGeometry;
+    render.body.geometry = render.dna === 'iron' ? wormBodyHexGeometry : wormBodyRoundGeometry;
 
     // Flat shading helps the tank read as plated/armored.
     render.material.flatShading = render.dna === 'iron';
     render.material.needsUpdate = true;
 
-    render.spine.visible = render.dna === 'shadow';
+    render.spine.visible = false;
+    if (render.scarf) render.scarf.visible = render.dna === 'shadow';
+    if (render.magicCircle) render.magicCircle.visible = render.dna === 'magnetic';
 
     const skin = buildSkin(render.dna, render.skinSeed, render.color);
     render.skinPalette = skin.palette;
@@ -2034,8 +2443,8 @@ async function main() {
     };
 
     if (render.dna === 'iron') {
-      const primary = makeHeadMat(0x2c3642);
-      const accent = makeHeadMat(0xe07b39);
+      const primary = makeHeadMat(0xf0f4f8);
+      const accent = makeHeadMat(0xffd700);
       render.headMaterials.push(primary, accent);
 
       const headBody = new THREE.Mesh(ironHeadBodyGeometry, primary);
@@ -2058,29 +2467,25 @@ async function main() {
       innerMesh.renderOrder = 4;
       render.head.add(outerMesh, innerMesh);
     } else {
-      const primary = makeHeadMat(0x8cff00);
-      const mouth = makeHeadMat(0xfff15a);
-      const disc = makeHeadMat(0x05060a);
-      primary.roughness = 0.24;
-      primary.metalness = 0.0;
-      mouth.roughness = 0.18;
-      mouth.metalness = 0.0;
-      disc.roughness = 0.95;
-      disc.metalness = 0.0;
-      render.headMaterials.push(primary, mouth, disc);
+      const orb = makeHeadMat(0x191970);
+      const rune = makeHeadMat(0xff007f);
+      orb.roughness = 0.18;
+      orb.metalness = 0.0;
+      rune.roughness = 0.14;
+      rune.metalness = 0.0;
+      render.headMaterials.push(orb, rune);
 
-      const headBody = new THREE.Mesh(magneticHeadGeometry, primary);
-      const mouthTube = new THREE.Mesh(magneticMouthGeometry, mouth);
-      const mouthDisc = new THREE.Mesh(magneticMouthDiscGeometry, disc);
-      headBody.renderOrder = 4;
-      mouthTube.renderOrder = 4;
-      mouthDisc.renderOrder = 4;
-      render.head.add(headBody, mouthTube, mouthDisc);
+      const orbMesh = new THREE.Mesh(arcanaOrbGeometry, orb);
+      const ringMesh = new THREE.Mesh(arcanaRingGeometry, rune);
+      orbMesh.renderOrder = 4;
+      ringMesh.renderOrder = 4;
+      render.head.add(orbMesh, ringMesh);
     }
   }
 
   function destroyMissingPlayers(players: Record<string, PlayerState>): void {
     for (const [id, render] of playerRenders) {
+      if (id === LOBBY_PREVIEW_ID) continue;
       if (players[id]) continue;
       const head = render.segs[0] ?? render.targetSegs[0];
       if (head) {
@@ -2165,6 +2570,17 @@ async function main() {
     render.headMaterials.length = 0;
     (render.shadow.material as THREE.Material).dispose();
     (render.aura.material as THREE.Material).dispose();
+    if (render.scarf) {
+      render.group.remove(render.scarf);
+      render.scarf.geometry.dispose();
+      (render.scarf.material as THREE.Material).dispose();
+      render.scarf = undefined;
+    }
+    if (render.magicCircle) {
+      render.group.remove(render.magicCircle);
+      (render.magicCircle.material as THREE.Material).dispose();
+      render.magicCircle = undefined;
+    }
     const nameMat = render.nameSprite.material as THREE.SpriteMaterial;
     if (nameMat.map) nameMat.map.dispose();
     nameMat.dispose();
@@ -2196,7 +2612,38 @@ async function main() {
     }
 
     const nextFoodMap = new Map<string, FoodState>();
-    for (const f of state.foods) nextFoodMap.set(f.id, f);
+    for (const v of foodVisuals.values()) v.present = false;
+    for (const f of state.foods) {
+      nextFoodMap.set(f.id, f);
+
+      const existing = foodVisuals.get(f.id);
+      if (existing) {
+        existing.tx = f.x;
+        existing.ty = f.y;
+        existing.tr = f.r;
+        existing.color = f.color;
+        existing.value = f.value;
+        existing.present = true;
+        existing.sucked = false;
+        existing.suckLift = 0;
+      } else {
+        foodVisuals.set(f.id, {
+          id: f.id,
+          x: f.x,
+          y: f.y,
+          tx: f.x,
+          ty: f.y,
+          r: f.r,
+          tr: f.r,
+          color: f.color,
+          value: f.value,
+          present: true,
+          alpha: 0,
+          sucked: false,
+          suckLift: 0,
+        });
+      }
+    }
 
     // Food pop FX: only trigger if a head is close enough (foods may stream in/out).
     if (prevFoodMap.size > 0) {
@@ -2231,6 +2678,46 @@ async function main() {
         spawnBurst(particles, from, prev.color, 4 + prev.value * 2);
         spawnRing(particles, from, prev.color, Math.max(12, prev.r * (2.4 + prev.value * 1.1)));
         spawnEatSuction(particles, from, to, prev.color, eater.dna, prev.value);
+
+        if (eater.dna === 'magnetic') {
+          const v = foodVisuals.get(id);
+          if (v) {
+            const length = eater.segments.length;
+            const headMul = 1.12; // magnetic
+            const headBase = headRadiusForLength(length) * headMul;
+
+            let fx = 1;
+            let fy = 0;
+            const neck = eater.segments[1];
+            if (neck) {
+              const dx = to.x - neck.x;
+              const dy = to.y - neck.y;
+              const d2 = dx * dx + dy * dy;
+              if (d2 > 0.001) {
+                const inv = 1 / Math.sqrt(d2);
+                fx = dx * inv;
+                fy = dy * inv;
+              }
+            } else {
+              const dx = to.x - from.x;
+              const dy = to.y - from.y;
+              const d2 = dx * dx + dy * dy;
+              if (d2 > 0.001) {
+                const inv = 1 / Math.sqrt(d2);
+                fx = dx * inv;
+                fy = dy * inv;
+              }
+            }
+
+            // Aim slightly "inside" the head so the food visibly gets swallowed.
+            v.tx = to.x + fx * headBase * 0.22;
+            v.ty = to.y + fy * headBase * 0.22;
+            v.tr = Math.max(0.6, prev.r * 0.08);
+            v.sucked = true;
+            v.suckLift = clamp(headBase * 0.95, 18, 76);
+          }
+          spawnRing(particles, to, mixColor(prev.color, 0xa55cff, 0.35), Math.max(10, prev.r * 1.8));
+        }
 
         const eaterRender = ensurePlayerRender(eater.id);
         eaterRender.eatFx = 1;
@@ -2529,8 +3016,35 @@ async function main() {
     }
 
     mutationOverlay.classList.remove('hidden');
-    boosting = false;
-    sendInput(true);
+
+    // "Spit out" animation: cards emerge from the player's head position (~1s).
+    window.requestAnimationFrame(() => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      let spawnX = w * 0.5;
+      let spawnY = h * 0.5;
+
+      const me = myId && latestState ? latestState.players[myId] : undefined;
+      const head = me?.segments?.[0];
+      if (head) {
+        const tmp = new THREE.Vector3(head.x, 0, head.y).project(camera3);
+        spawnX = (tmp.x * 0.5 + 0.5) * w;
+        spawnY = (-tmp.y * 0.5 + 0.5) * h;
+      }
+
+      for (let i = 0; i < mutationCards.children.length; i++) {
+        const card = mutationCards.children[i] as HTMLButtonElement;
+        const rect = card.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const dx = spawnX - cx;
+        const dy = spawnY - cy;
+        card.style.setProperty('--from-x', `${dx}px`);
+        card.style.setProperty('--from-y', `${dy}px`);
+        card.style.animationDelay = `${i * 70}ms`;
+        card.classList.add('spit');
+      }
+    });
   }
 
   function getMySkillState():
@@ -2586,6 +3100,7 @@ async function main() {
     latestState = undefined;
     lastLen = 0;
     foods = [];
+    foodVisuals.clear();
     gas = [];
     decoys = [];
     blackHoles = [];
@@ -2605,6 +3120,9 @@ async function main() {
     camera.x = 0;
     camera.y = 0;
     camera.zoom = 1;
+    foodGlowMesh.count = 0;
+    foodGlowMesh.instanceMatrix.needsUpdate = true;
+    if (foodGlowMesh.instanceColor) foodGlowMesh.instanceColor.needsUpdate = true;
     foodMesh.count = 0;
     foodMesh.instanceMatrix.needsUpdate = true;
     if (foodMesh.instanceColor) foodMesh.instanceColor.needsUpdate = true;
@@ -2669,6 +3187,7 @@ async function main() {
         disconnected = false;
         respawnBtn.textContent = '다시하기';
         myId = socket?.id;
+        socket?.emit('respawn');
         socket?.emit('join', { name: joinName, dna: joinClass });
       });
 
@@ -2689,14 +3208,9 @@ async function main() {
 
     socket.on('state', (payload) => {
       ingestState(payload);
-      const me = myId ? payload.players[myId] : undefined;
-      const alive = Boolean(me?.segments[0]);
-      if (alive) {
-        death.classList.toggle('hidden', true);
-      } else if (myId) {
-        // When not playing (menu) or while fading back, keep the death panel hidden.
-        death.classList.toggle('hidden', !uiPlaying || deathFading);
-      }
+      // Death UX is handled via a fade-back-to-menu transition.
+      // Keep the "death" panel reserved for disconnect/reconnect errors only.
+      death.classList.add('hidden');
     });
 
     socket.on('mutationOffer', (offer) => {
@@ -2709,8 +3223,15 @@ async function main() {
       cancelSkillAim();
       uiRoot.classList.remove('gas');
       deathText.textContent = `점수: ${formatScore(payload.score)} (${payload.reason})`;
+      try {
+        localStorage.setItem(LAST_SCORE_KEY, String(payload.score));
+        const best = Math.max(payload.score, readStoredScore(BEST_SCORE_KEY));
+        localStorage.setItem(BEST_SCORE_KEY, String(best));
+        renderMenuStats();
+      } catch {
+        // ignore
+      }
       death.classList.add('hidden');
-      respawnBtn.textContent = '다시하기';
       const me = myId ? playerRenders.get(myId) : undefined;
       const head = me?.segs[0] ?? me?.targetSegs[0];
       if (head && me) {
@@ -2727,18 +3248,15 @@ async function main() {
       sendInput(true);
       deathFading = true;
       uiRoot.classList.add('deathfade');
-      if (deathFadeToMenuTimer) window.clearTimeout(deathFadeToMenuTimer);
       if (deathFadeOverlayTimer) window.clearTimeout(deathFadeOverlayTimer);
-      deathFadeToMenuTimer = window.setTimeout(() => {
-        setUiPlaying(false);
-        deathFading = false;
-        deathFadeToMenuTimer = undefined;
 
-        // Let the menu settle, then lift the overlay.
-        deathFadeOverlayTimer = window.setTimeout(() => {
-          uiRoot.classList.remove('deathfade');
-          deathFadeOverlayTimer = undefined;
-        }, 280);
+      // Show the main menu immediately and let it fade in under the overlay.
+      setUiPlaying(false);
+
+      deathFadeOverlayTimer = window.setTimeout(() => {
+        deathFading = false;
+        uiRoot.classList.remove('deathfade');
+        deathFadeOverlayTimer = undefined;
       }, 650);
     });
 
@@ -2765,6 +3283,7 @@ async function main() {
       return;
     }
 
+    socket.emit('respawn');
     socket.emit('join', { name: joinName, dna: joinClass });
   }
 
@@ -2966,6 +3485,14 @@ async function main() {
     sendInput();
   });
 
+  // Allow steering while the mutation picker is open (the overlay may intercept pointer events).
+  window.addEventListener('pointermove', (e: PointerEvent) => {
+    if (!menu.classList.contains('hidden')) return;
+    if (mutationOverlay.classList.contains('hidden')) return;
+    updateTargetAngle(e.clientX, e.clientY);
+    sendInput();
+  });
+
   // Prevent the browser context menu when using right-click for skills.
   renderer.domElement.addEventListener('contextmenu', (e) => {
     e.preventDefault();
@@ -2986,14 +3513,16 @@ async function main() {
       if (e.code === 'Digit1') {
         chooseMutation(pendingChoices[0]);
         e.preventDefault();
+        return;
       } else if (e.code === 'Digit2') {
         chooseMutation(pendingChoices[1]);
         e.preventDefault();
+        return;
       } else if (e.code === 'Digit3') {
         chooseMutation(pendingChoices[2]);
         e.preventDefault();
+        return;
       }
-      return;
     }
 
     if (e.code !== 'Space') return;
@@ -3030,34 +3559,68 @@ async function main() {
     sendInput(true);
   });
 
+  // Mouse-event fallback for right-click skills on browsers/environments where pointer events are unreliable.
+  const MOUSE_FALLBACK_POINTER_ID = -1;
+  const RIGHT_CLICK_FALLBACK_MS = 80;
+  let lastPointerRightDownAt = 0;
+  let lastPointerRightUpAt = 0;
+
   window.addEventListener('pointerdown', (e) => {
     if (!menu.classList.contains('hidden')) return;
-    if (e.target !== renderer.domElement) return;
-    if (e.button === 0) {
-      boosting = true;
-      sendInput(true);
-      return;
-    }
 
-    if (e.button !== 2) return;
-    const s = getMySkillState();
-    if (!s) return;
+    const rightDown = e.button === 2 || (e.buttons & 2) === 2;
+    if (rightDown) {
+      lastPointerRightDownAt = performance.now();
+      if (mutationOpen) return;
+      const s = getMySkillState();
+      if (!s) return;
 
-    if (s.skill === 'shadow_phantom_decoy') {
-      if (s.progress <= 0.01) return;
-      skillHoldPointerId = e.pointerId;
-      startSkillHold();
+      if (s.skill === 'shadow_phantom_decoy') {
+        if (s.progress <= 0.01) return;
+        skillHoldPointerId = e.pointerId;
+        startSkillHold();
+        e.preventDefault();
+        return;
+      }
+
+      if (s.skill === 'ultimate_magnetic_magnet') {
+        if (s.cd > 0) return;
+        skillAiming = true;
+        skillAimPointerId = e.pointerId;
+        skillAimStartX = e.clientX;
+        skillAimStartY = e.clientY;
+        skillAimMoved = false;
+        skillAimTarget = undefined;
+
+        const hit = raycastWorld(e.clientX, e.clientY);
+        if (hit) {
+          skillAimTarget = clampSingularityTarget(hit);
+          skillAimMoved = true; // right-click uses point & click (and drag) targeting
+        }
+
+        if (skillAimMoved && skillAimTarget) {
+          aimIndicator.visible = true;
+          aimIndicator.position.set(skillAimTarget.x, 0.035, skillAimTarget.y);
+          aimIndicator.scale.set(SINGULARITY_RADIUS, 1, SINGULARITY_RADIUS);
+        } else {
+          aimIndicator.visible = false;
+        }
+
+        e.preventDefault();
+        return;
+      }
+
+      tryTapSkill();
       e.preventDefault();
       return;
     }
 
-    let target: Vec2f | undefined;
-    if (s.skill === 'ultimate_magnetic_magnet') {
-      const hit = raycastWorld(e.clientX, e.clientY);
-      if (hit) target = clampSingularityTarget(hit);
+    if (e.button === 0) {
+      if (e.target !== renderer.domElement) return;
+      boosting = true;
+      sendInput(true);
+      return;
     }
-    tryTapSkill(target);
-    e.preventDefault();
   });
 
   window.addEventListener('pointerup', (e) => {
@@ -3067,9 +3630,133 @@ async function main() {
       return;
     }
 
-    if (e.button === 2 && skillHoldPointerId === e.pointerId) {
+    if (e.button === 2) {
+      lastPointerRightUpAt = performance.now();
+      if (skillHoldPointerId === e.pointerId) {
+        endSkillHold();
+      }
+      if (skillAiming && skillAimPointerId === e.pointerId) {
+        const target = skillAimTarget;
+        cancelSkillAim();
+        tryTapSkill(target);
+      }
+    }
+  });
+
+  window.addEventListener('pointermove', (e: PointerEvent) => {
+    if (!menu.classList.contains('hidden')) return;
+    if (!skillAiming) return;
+    if (skillAimPointerId !== e.pointerId) return;
+
+    const ddx = e.clientX - skillAimStartX;
+    const ddy = e.clientY - skillAimStartY;
+    if (!skillAimMoved && ddx * ddx + ddy * ddy > SKILL_AIM_DRAG_PX * SKILL_AIM_DRAG_PX) {
+      skillAimMoved = true;
+    }
+
+    const hit = raycastWorld(e.clientX, e.clientY);
+    if (!hit) return;
+    skillAimTarget = clampSingularityTarget(hit);
+
+    if (skillAimMoved && skillAimTarget) {
+      aimIndicator.visible = true;
+      aimIndicator.position.set(skillAimTarget.x, 0.035, skillAimTarget.y);
+      aimIndicator.scale.set(SINGULARITY_RADIUS, 1, SINGULARITY_RADIUS);
+    } else {
+      aimIndicator.visible = false;
+    }
+  });
+
+  window.addEventListener('mousedown', (e: MouseEvent) => {
+    if (e.button !== 2) return;
+    if (!menu.classList.contains('hidden')) return;
+    if (performance.now() - lastPointerRightDownAt < RIGHT_CLICK_FALLBACK_MS) return;
+    if (mutationOpen) return;
+
+    const s = getMySkillState();
+    if (!s) return;
+
+    if (s.skill === 'shadow_phantom_decoy') {
+      if (s.progress <= 0.01) return;
+      skillHoldPointerId = MOUSE_FALLBACK_POINTER_ID;
+      startSkillHold();
+      e.preventDefault();
+      return;
+    }
+
+    if (s.skill === 'ultimate_magnetic_magnet') {
+      if (s.cd > 0) return;
+      skillAiming = true;
+      skillAimPointerId = MOUSE_FALLBACK_POINTER_ID;
+      skillAimStartX = e.clientX;
+      skillAimStartY = e.clientY;
+      skillAimMoved = false;
+      skillAimTarget = undefined;
+
+      const hit = raycastWorld(e.clientX, e.clientY);
+      if (hit) {
+        skillAimTarget = clampSingularityTarget(hit);
+        skillAimMoved = true;
+      }
+
+      if (skillAimMoved && skillAimTarget) {
+        aimIndicator.visible = true;
+        aimIndicator.position.set(skillAimTarget.x, 0.035, skillAimTarget.y);
+        aimIndicator.scale.set(SINGULARITY_RADIUS, 1, SINGULARITY_RADIUS);
+      } else {
+        aimIndicator.visible = false;
+      }
+
+      e.preventDefault();
+      return;
+    }
+
+    tryTapSkill();
+    e.preventDefault();
+  });
+
+  window.addEventListener('mouseup', (e: MouseEvent) => {
+    if (e.button !== 2) return;
+    if (performance.now() - lastPointerRightUpAt < RIGHT_CLICK_FALLBACK_MS) return;
+
+    if (skillHoldPointerId === MOUSE_FALLBACK_POINTER_ID) {
       endSkillHold();
     }
+    if (skillAiming && skillAimPointerId === MOUSE_FALLBACK_POINTER_ID) {
+      const target = skillAimTarget;
+      cancelSkillAim();
+      tryTapSkill(target);
+    }
+  });
+
+  window.addEventListener('mousemove', (e: MouseEvent) => {
+    if (!menu.classList.contains('hidden')) return;
+    if (!skillAiming) return;
+    if (skillAimPointerId !== MOUSE_FALLBACK_POINTER_ID) return;
+
+    const ddx = e.clientX - skillAimStartX;
+    const ddy = e.clientY - skillAimStartY;
+    if (!skillAimMoved && ddx * ddx + ddy * ddy > SKILL_AIM_DRAG_PX * SKILL_AIM_DRAG_PX) {
+      skillAimMoved = true;
+    }
+
+    const hit = raycastWorld(e.clientX, e.clientY);
+    if (!hit) return;
+    skillAimTarget = clampSingularityTarget(hit);
+
+    if (skillAimMoved && skillAimTarget) {
+      aimIndicator.visible = true;
+      aimIndicator.position.set(skillAimTarget.x, 0.035, skillAimTarget.y);
+      aimIndicator.scale.set(SINGULARITY_RADIUS, 1, SINGULARITY_RADIUS);
+    } else {
+      aimIndicator.visible = false;
+    }
+  });
+
+  // Block the browser context menu during gameplay (right-click is used for skills).
+  window.addEventListener('contextmenu', (e) => {
+    if (!menu.classList.contains('hidden')) return;
+    e.preventDefault();
   });
 
   window.addEventListener('blur', () => {
@@ -3081,6 +3768,14 @@ async function main() {
 
   // Render loop (rAF): smooth positions + 3D update.
   const camOffset = new THREE.Vector3(-900, 1150, 900);
+  const camPos = new THREE.Vector3();
+  const camTarget = new THREE.Vector3();
+  const camForward = new THREE.Vector3();
+  const camUp = new THREE.Vector3();
+  const camRollQuat = new THREE.Quaternion();
+  let cameraBank = 0;
+  let meHeading = 0;
+  let meHeadingValid = false;
   let lastFrame = performance.now();
 
   const tick = (): void => {
@@ -3091,20 +3786,11 @@ async function main() {
 
     const screenW = window.innerWidth;
     const screenH = window.innerHeight;
-
-    if (!latestState) {
-      camera3.zoom = camera.zoom;
-      camera3.position.set(camOffset.x, camOffset.y, camOffset.z);
-      camera3.lookAt(0, 0, 0);
-      camera3.updateProjectionMatrix();
-      renderer.render(scene, camera3);
-      requestAnimationFrame(tick);
-      return;
-    }
+    const inMenu = !menu.classList.contains('hidden');
 
     const meRender = myId ? playerRenders.get(myId) : undefined;
     const meHead = meRender?.segs[0];
-    const meState = myId ? latestState.players[myId] : undefined;
+    const meState = myId && latestState ? latestState.players[myId] : undefined;
     const meTargetHead = meState?.segments[0];
     const myLen = meState?.segments.length ?? 0;
     const myDna = meState?.dna;
@@ -3119,7 +3805,7 @@ async function main() {
       const hy = meTargetHead?.y ?? meHead?.y ?? 0;
       const fovCapScale = myDna === 'magnetic' ? 1 / 1.2 : 1;
       const minZoom = Math.max((CAMERA_BASE_MIN_ZOOM * fovCapScale) / fovMul, CAMERA_ABS_MIN_ZOOM * fovCapScale);
-      const baseZoom = clamp((1.22 - myLen / 175) / fovMul, minZoom, 1.14);
+      const baseZoom = clamp((1.38 - myLen / 210) / fovMul, minZoom, 1.32);
       const targetZoom = baseZoom * (meBoostingVisual ? 0.96 : 1);
 
       const camK = 14;
@@ -3129,6 +3815,10 @@ async function main() {
       camera.x = lerp(camera.x, hx, a);
       camera.y = lerp(camera.y, hy, a);
       camera.zoom = lerp(camera.zoom, targetZoom, za);
+    } else if (inMenu) {
+      // Menu feels better with a tighter default camera, even before joining.
+      const menuZoom = 1.28;
+      camera.zoom = lerp(camera.zoom, menuZoom, smoothFactor(6, dt));
     }
 
     const zoom = camera.zoom;
@@ -3138,9 +3828,45 @@ async function main() {
     const shakeX = Math.sin(t * 47.2) * shakeAmp;
     const shakeZ = Math.cos(t * 53.9) * shakeAmp;
 
+    // Camera banking (roll) based on actual turn rate (derived from head/neck).
+    let cameraBankTarget = 0;
+    const h0 = meState?.segments[0];
+    const h1 = meState?.segments[1];
+    if (menu.classList.contains('hidden') && h0 && h1) {
+      const dx = h0.x - h1.x;
+      const dy = h0.y - h1.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 0.001) {
+        const headingNow = Math.atan2(dy, dx);
+        const prev = meHeadingValid ? meHeading : headingNow;
+        const dHeading = normalizeAngle(headingNow - prev);
+        meHeading = headingNow;
+        meHeadingValid = true;
+
+        const safeDt = Math.max(dt, 1 / 120);
+        const turnRate = dHeading / safeDt;
+        const classMul = myDna === 'shadow' ? 1.1 : myDna === 'iron' ? 0.92 : 1;
+        const maxBank = CAMERA_BANK_MAX * classMul;
+        cameraBankTarget = clamp(-turnRate / CAMERA_BANK_TURN_RATE_FOR_MAX, -1, 1) * maxBank;
+      } else {
+        meHeadingValid = false;
+      }
+    } else {
+      meHeadingValid = false;
+    }
+    cameraBank = lerp(cameraBank, cameraBankTarget, smoothFactor(CAMERA_BANK_K, dt));
+
     camera3.zoom = zoom;
-    camera3.position.set(camera.x + camOffset.x + shakeX, camOffset.y, camera.y + camOffset.z + shakeZ);
-    camera3.lookAt(camera.x + shakeX * 0.1, 0, camera.y + shakeZ * 0.1);
+    camPos.set(camera.x + camOffset.x + shakeX, camOffset.y, camera.y + camOffset.z + shakeZ);
+    camTarget.set(camera.x + shakeX * 0.1, 0, camera.y + shakeZ * 0.1);
+    camForward.subVectors(camTarget, camPos);
+    if (camForward.lengthSq() > 0.000001) camForward.normalize();
+    else camForward.set(0, -1, 0);
+    camRollQuat.setFromAxisAngle(camForward, cameraBank);
+    camUp.copy(up).applyQuaternion(camRollQuat);
+    camera3.up.copy(camUp);
+    camera3.position.copy(camPos);
+    camera3.lookAt(camTarget);
     camera3.updateProjectionMatrix();
 
     // View bounds (perspective): raycast screen corners onto the ground plane.
@@ -3180,7 +3906,7 @@ async function main() {
     // Sixth Sense: edge warning for off-screen fast approaches.
     const hasSixthSense = countMutation(meState?.mutations, 'sixth_sense') > 0;
     const meSenseHead = meTargetHead ?? meHead;
-    if (myId && hasSixthSense && meSenseHead) {
+    if (latestState && myId && hasSixthSense && meSenseHead) {
       const horizonSec = 3.2;
       const maxDist = 5200;
       const margin = 28;
@@ -3247,6 +3973,30 @@ async function main() {
     } else {
       sixthSense.classList.add('hidden');
       while (sixthSense.firstChild) sixthSense.removeChild(sixthSense.firstChild);
+    }
+
+    // Lobby 3D preview pose: keep it framed on the left while the menu panel sits on the right.
+    if (inMenu && lobbyPreviewRender) {
+      const viewW = view.maxX - view.minX;
+      const viewH = view.maxY - view.minY;
+      const cx = (view.minX + view.maxX) * 0.5 - viewW * 0.13;
+      const cy = (view.minY + view.maxY) * 0.5 + viewH * 0.11;
+
+      const seed = lobbyPreviewRender.skinOffset;
+      const turns = lobbyClass === 'iron' ? 1.15 : lobbyClass === 'shadow' ? 1.35 : 1.25;
+      const outerR = lobbyClass === 'iron' ? 340 : lobbyClass === 'shadow' ? 300 : 320;
+      const innerR = lobbyClass === 'iron' ? 110 : lobbyClass === 'shadow' ? 90 : 120;
+      const spin = -t * (lobbyClass === 'iron' ? 0.12 : lobbyClass === 'shadow' ? 0.18 : 0.16);
+      const wiggle = lobbyClass === 'iron' ? 0.04 : lobbyClass === 'shadow' ? 0.085 : 0.07;
+
+      for (let i = 0; i < lobbyPreviewPose.length; i++) {
+        const f = lobbyPreviewPose.length <= 1 ? 0 : i / (lobbyPreviewPose.length - 1);
+        const r = lerp(outerR, innerR, f) * (1 + Math.sin(t * 1.05 + f * 7.0 + seed * 6.0) * 0.03);
+        const a = spin + f * turns * Math.PI * 2 + Math.sin(t * 0.8 + f * 6.2 + seed * 10.0) * wiggle;
+        lobbyPreviewPose[i]!.x = cx + Math.cos(a) * r;
+        lobbyPreviewPose[i]!.y = cy + Math.sin(a) * r;
+      }
+      syncTargetSegments(lobbyPreviewRender, lobbyPreviewPose);
     }
 
     // Smooth players
@@ -3370,23 +4120,95 @@ async function main() {
 
     // Foods (culled)
     let foodCount = 0;
-    const foodMargin = 520;
-    for (const f of foods) {
-      if (foodCount >= FOOD_MAX_INST) break;
+    const foodMargin = 720;
+    const foodPosA = smoothFactor(20, dt);
+    const foodPosSuckA = smoothFactor(46, dt);
+    const foodFadeInA = smoothFactor(22, dt);
+    const foodFadeOutA = smoothFactor(12, dt);
+    const foodFadeSuckA = smoothFactor(18, dt);
+    for (const [id, f] of foodVisuals) {
+      // Smooth food positions & presence to avoid "stream pop" flicker.
+      if (f.present) f.sucked = false;
+      const posA = f.sucked ? foodPosSuckA : foodPosA;
+      const fadeA = f.present ? foodFadeInA : f.sucked ? foodFadeSuckA : foodFadeOutA;
+      f.x = lerp(f.x, f.tx, posA);
+      f.y = lerp(f.y, f.ty, posA);
+      f.r = lerp(f.r, f.tr, posA);
+      f.alpha = lerp(f.alpha, f.present ? 1 : 0, fadeA);
+      if (!f.present && f.alpha <= 0.02) {
+        foodVisuals.delete(id);
+        continue;
+      }
+
+      if (foodCount >= FOOD_MAX_INST) continue;
       if (!isInsideView(f.x, f.y, view, foodMargin)) continue;
 
       const phase = foodPhase(f.id);
-      const pulse = 0.86 + 0.14 * Math.sin(t * 2.6 + phase);
-      const r = f.r * pulse;
+      // Slow, smooth "breathing" glow (avoid fast flicker).
+      const pulse = 0.985 + 0.015 * Math.sin(t * 0.55 + phase * 0.85);
+      const shimmer = 0.5 + 0.5 * Math.sin(t * 0.75 + phase * 0.35);
+      const fadeSize = 0.6 + 0.4 * f.alpha;
 
-      tmpObj.position.set(f.x, r * 0.98, f.y);
-      tmpObj.scale.set(r, r, r);
+      let renderX = f.x;
+      let renderY = f.y;
+      let swallowE = 0;
+      if (f.sucked) {
+        const dx = f.tx - f.x;
+        const dy = f.ty - f.y;
+        const dist = Math.hypot(dx, dy);
+        const swallow = clamp(1 - dist / 220, 0, 1);
+        swallowE = 1 - Math.pow(1 - swallow, 3);
+
+        const inv = dist > 0.001 ? 1 / dist : 0;
+        const ux = dist > 0.001 ? dx * inv : 1;
+        const uy = dist > 0.001 ? dy * inv : 0;
+        const sx = -uy;
+        const sy = ux;
+        const swirlAmp = (1 - swallowE) * Math.min(22, dist * 0.18);
+        const swirl = Math.sin(t * 13.0 + phase * 1.7) * swirlAmp;
+        renderX += sx * swirl;
+        renderY += sy * swirl;
+      }
+
+      const coreR = f.r * (0.84 + f.value * 0.05) * pulse * fadeSize;
+      const glowMul = f.sucked ? 1 - swallowE * 0.85 : 1;
+      const glowPulse = 0.97 + 0.03 * Math.sin(t * 0.45 + phase * 0.6);
+      const glowR =
+        f.r * (2.05 + f.value * 0.38) * glowPulse * (0.45 + 0.55 * f.alpha) * glowMul;
+
+      const liftMax = f.suckLift > 0 ? f.suckLift : 26;
+      const coreLift = f.sucked ? swallowE * liftMax : 0;
+      const glowLift = coreLift * 0.18;
+
+      const coreColor = shade(mixColor(f.color, 0xffffff, 0.22), (0.38 + 0.62 * f.alpha) * (0.95 + shimmer * 0.08));
+      const glowColor = shade(
+        mixColor(f.color, 0xffffff, 0.72),
+        (0.22 + 0.78 * f.alpha) * (0.82 + shimmer * 0.22) * (f.sucked ? 1 - swallowE * 0.85 : 1),
+      );
+
+      // Glow (ground disc)
+      tmpObj.position.set(renderX, 0.28 + f.r * 0.04 + glowLift, renderY);
+      tmpObj.quaternion.identity();
+      tmpObj.scale.set(glowR, glowR, glowR);
+      tmpObj.updateMatrix();
+      foodGlowMesh.setMatrixAt(foodCount, tmpObj.matrix);
+      tmpColor.setHex(glowColor);
+      foodGlowMesh.setColorAt(foodCount, tmpColor);
+
+      // Core (sphere)
+      tmpObj.position.set(renderX, Math.max(1, coreR * 0.98) + coreLift, renderY);
+      tmpObj.quaternion.identity();
+      tmpObj.scale.set(coreR, coreR, coreR);
       tmpObj.updateMatrix();
       foodMesh.setMatrixAt(foodCount, tmpObj.matrix);
-      tmpColor.setHex(f.color);
+      tmpColor.setHex(coreColor);
       foodMesh.setColorAt(foodCount, tmpColor);
+
       foodCount++;
     }
+    foodGlowMesh.count = foodCount;
+    foodGlowMesh.instanceMatrix.needsUpdate = true;
+    if (foodGlowMesh.instanceColor) foodGlowMesh.instanceColor.needsUpdate = true;
     foodMesh.count = foodCount;
     foodMesh.instanceMatrix.needsUpdate = true;
     if (foodMesh.instanceColor) foodMesh.instanceColor.needsUpdate = true;
@@ -3428,10 +4250,15 @@ async function main() {
       const segsForCull = render.targetSegs.length > 0 ? render.targetSegs : render.segs;
       if (segsForCull.length === 0) continue;
 
-      const margin = render.group.visible ? playerHideMargin : playerShowMargin;
-      const visible = id === myId || isAnySegmentInsideView(segsForCull, view, margin);
-      render.group.visible = visible;
-      if (!visible) continue;
+      if (id === LOBBY_PREVIEW_ID) {
+        render.group.visible = inMenu;
+        if (!render.group.visible) continue;
+      } else {
+        const margin = render.group.visible ? playerHideMargin : playerShowMargin;
+        const visible = id === myId || isAnySegmentInsideView(segsForCull, view, margin);
+        render.group.visible = visible;
+        if (!visible) continue;
+      }
 
       const head = render.segs[0] ?? render.targetSegs[0];
       if (!head) continue;
@@ -3441,7 +4268,11 @@ async function main() {
       const phaseVisual = id === myId ? false : render.phase;
       const skill = findSkillMutation(render.mutations);
 
-      setNameSprite(render, render.name);
+      if (id !== LOBBY_PREVIEW_ID) {
+        setNameSprite(render, render.name);
+      } else {
+        render.nameSprite.visible = false;
+      }
       applyClassVisual(render);
 
       const length = Math.max(1, render.visualLen || render.segs.length);
@@ -3457,13 +4288,19 @@ async function main() {
       const palette = render.skinPalette.length > 0 ? render.skinPalette : [render.color];
       const stripe = Math.max(1, render.skinStripe);
 
-      const ironGun = palette[0] ?? 0x2c3642;
-      const ironOrange = palette[1] ?? palette[2] ?? 0xe07b39;
-      const magneticGreen = palette[0] ?? 0x8cff00;
-      const magneticYellow = palette[2] ?? 0xfff15a;
+      const ironSteel = palette[0] ?? 0xf0f4f8;
+      const ironJoint = palette[2] ?? 0x2b303b;
+      const ironAccent = palette[4] ?? 0xffd700;
+
+      const mageBase = palette[0] ?? 0x191970;
+      const mageNebula = palette[2] ?? 0xff007f;
+      const mageStar = palette[4] ?? 0xe0ffff;
+
+      const shadowNeonA = palette[3] ?? 0x00e5ff;
+      const shadowNeonB = palette[5] ?? 0xb000ff;
       const shadowNeon = mixColor(
-        0x00e5ff,
-        0xb000ff,
+        shadowNeonA,
+        shadowNeonB,
         0.5 + 0.5 * Math.sin(t * 1.7 + length * 0.04 + render.skinOffset * 8.0),
       );
 
@@ -3474,14 +4311,14 @@ async function main() {
       const bodyOpacity = render.dna === 'shadow' ? opacity * 0.78 : opacity;
 
       if (render.dna === 'iron') {
-        render.material.metalness = 0.78;
-        render.material.roughness = 0.76;
+        render.material.metalness = 0.92;
+        render.material.roughness = 0.42;
       } else if (render.dna === 'shadow') {
-        render.material.metalness = 0.0;
-        render.material.roughness = 0.16;
+        render.material.metalness = 0.05;
+        render.material.roughness = 0.38;
       } else {
         render.material.metalness = 0.0;
-        render.material.roughness = 0.22;
+        render.material.roughness = 0.2;
       }
 
       render.material.opacity = bodyOpacity;
@@ -3490,9 +4327,9 @@ async function main() {
         render.material.depthWrite = false;
         render.material.emissive.setHex(shadowNeon);
         render.material.emissiveIntensity = clamp(
-          (boostingVisual ? 0.62 : 0.42) * visMul * spawnAlpha + (render.skillActive ? 0.16 : 0),
+          (boostingVisual ? 0.42 : 0.28) * visMul * spawnAlpha + (render.skillActive ? 0.12 : 0),
           0,
-          1.4,
+          1.0,
         );
       } else {
         render.material.transparent = opacity < 1;
@@ -3506,14 +4343,14 @@ async function main() {
         const primary = render.headMaterials[0];
         const accent = render.headMaterials[1];
         if (primary) {
-          primary.color.setHex(ironGun);
+          primary.color.setHex(ironSteel);
           primary.metalness = 0.8;
-          primary.roughness = 0.78;
+          primary.roughness = 0.42;
         }
         if (accent) {
-          accent.color.setHex(siege ? 0xff3b2f : ironOrange);
-          accent.metalness = 0.55;
-          accent.roughness = 0.72;
+          accent.color.setHex(siege ? 0xff3b2f : ironAccent);
+          accent.metalness = 0.75;
+          accent.roughness = 0.38;
         }
       } else if (render.dna === 'shadow') {
         const outer = render.headMaterials[0];
@@ -3530,21 +4367,27 @@ async function main() {
           inner.metalness = 0.0;
           inner.roughness = 0.08;
           inner.emissive.setHex(shadowNeon);
-          inner.emissiveIntensity = clamp((boostingVisual ? 0.95 : 0.7) * visMul * spawnAlpha, 0, 1.6);
+          inner.emissiveIntensity = clamp((boostingVisual ? 0.85 : 0.6) * visMul * spawnAlpha, 0, 1.25);
         }
       } else {
-        const primary = render.headMaterials[0];
-        const mouth = render.headMaterials[1];
-        if (primary) {
-          primary.color.setHex(magneticGreen);
-          primary.metalness = 0.0;
-          primary.roughness = 0.24;
+        const orb = render.headMaterials[0];
+        const rune = render.headMaterials[1];
+        if (orb) {
+          const depth = 0.55 + 0.45 * Math.sin(t * 0.95 + length * 0.03 + render.skinOffset * 7.0);
+          orb.color.setHex(mixColor(mageBase, mageNebula, depth * 0.22));
+          orb.metalness = 0.0;
+          orb.roughness = 0.16;
+          orb.emissive.setHex(mixColor(mageStar, mageNebula, 0.28));
+          orb.emissiveIntensity = clamp(0.05 * spawnAlpha, 0, 0.12);
         }
-        if (mouth) {
-          const pulse = 0.55 + 0.45 * Math.sin(t * 2.8 + length * 0.02 + render.skinOffset * 6.0);
-          mouth.color.setHex(mixColor(magneticYellow, 0xffffff, pulse * 0.1));
-          mouth.metalness = 0.0;
-          mouth.roughness = 0.18;
+        if (rune) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.15 + length * 0.02 + render.skinOffset * 6.0);
+          const c = mixColor(mageNebula, mageStar, 0.3 + pulse * 0.55);
+          rune.color.setHex(c);
+          rune.metalness = 0.0;
+          rune.roughness = 0.12;
+          rune.emissive.setHex(c);
+          rune.emissiveIntensity = clamp((0.85 + (singularity ? 0.55 : 0)) * spawnAlpha, 0, 2.4);
         }
       }
 
@@ -3555,18 +4398,12 @@ async function main() {
         m.depthWrite = render.dna !== 'shadow' && opacity >= 1;
       }
 
-      // Inner spine (Shadow Snake): visible through glass body.
-      if (render.dna === 'shadow') {
-        render.spineMaterial.opacity = clamp(bodyOpacity * 0.7, 0, 0.65);
-        render.spineMaterial.transparent = true;
-        render.spineMaterial.depthWrite = false;
-        render.spineMaterial.emissive.setHex(shadowNeon);
-        render.spineMaterial.emissiveIntensity = clamp((boostingVisual ? 1.0 : 0.8) * visMul * spawnAlpha, 0, 1.8);
-      } else {
-        render.spineMaterial.opacity = 0;
-        render.spineMaterial.emissive.setHex(0x000000);
-        render.spineMaterial.emissiveIntensity = 0.0;
-      }
+      // Cyber Ninja spec: keep the body clean (no visible inner skeleton).
+      render.spineMaterial.opacity = 0;
+      render.spineMaterial.transparent = true;
+      render.spineMaterial.depthWrite = false;
+      render.spineMaterial.emissive.setHex(0x000000);
+      render.spineMaterial.emissiveIntensity = 0.0;
 
       // Contact shadow (grounded feel; hidden while invisible).
       const shadowMat = render.shadow.material as THREE.MeshBasicMaterial;
@@ -3580,14 +4417,14 @@ async function main() {
       const auraMat = render.aura.material as THREE.MeshBasicMaterial;
       render.aura.position.set(head.x, 0.03, head.y);
       render.aura.rotation.z = t * (render.dna === 'shadow' ? 2.0 : render.dna === 'magnetic' ? 1.2 : 0.8);
-      let auraColor = render.dna === 'iron' ? ironOrange : render.dna === 'shadow' ? shadowNeon : magneticGreen;
+      let auraColor = render.dna === 'iron' ? ironAccent : render.dna === 'shadow' ? shadowNeon : mageNebula;
       let auraOpacity = 0;
       let auraScale = headBase * 2.2;
 
       if (stealthVisual || phaseVisual) {
         auraOpacity = 0;
       } else if (render.dna === 'iron') {
-        auraColor = siege ? 0xff3b2f : mixColor(render.color, 0xffb15a, 0.7);
+        auraColor = siege ? 0xff3b2f : mixColor(ironAccent, 0xffffff, 0.45);
         auraScale = headBase * (2.35 + render.armor * 0.22 + (boostingVisual ? 0.15 : 0));
         auraOpacity = (render.armor > 0 ? 0.16 + render.armor * 0.03 : 0.06) + (boostingVisual ? 0.05 : 0);
       } else if (render.dna === 'shadow') {
@@ -3595,9 +4432,9 @@ async function main() {
         auraScale = headBase * (2.5 + (boostingVisual ? 0.3 : 0.0));
         auraOpacity = boostingVisual ? 0.14 : 0.06;
       } else {
-        auraColor = mixColor(0x8cff00, 0xa55cff, 0.5 + 0.5 * Math.sin(t * 1.1 + length * 0.02));
-        auraScale = headBase * (3.0 + (singularity ? 1.0 : 0));
-        auraOpacity = 0.12 + (singularity ? 0.06 : 0.0);
+        auraColor = mixColor(mageStar, mageNebula, 0.5 + 0.5 * Math.sin(t * 1.1 + length * 0.03 + render.skinOffset * 5));
+        auraScale = headBase * (3.1 + (singularity ? 1.1 : 0));
+        auraOpacity = 0.11 + (singularity ? 0.07 : 0.0);
       }
 
       // Eating pulse: quick "chomp" feedback for all classes.
@@ -3614,12 +4451,39 @@ async function main() {
 
       // Head pose (silhouette first: 0.1s readability)
       const neck = render.segs[1] ?? render.targetSegs[1];
+      let headDirOk = false;
       if (neck) {
-        tmpDir.set(head.x - neck.x, 0, head.y - neck.y);
-        if (tmpDir.lengthSq() > 0.001) {
-          tmpDir.normalize();
+        const dx = head.x - neck.x;
+        const dy = head.y - neck.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0.001) {
+          const headingNow = Math.atan2(dy, dx);
+          const prev = render.headingValid ? render.heading : headingNow;
+          const dHeading = normalizeAngle(headingNow - prev);
+          render.heading = headingNow;
+          render.headingValid = true;
+
+          const safeDt = Math.max(dt, 1 / 120);
+          const turnRate = dHeading / safeDt;
+
+          const classMul = render.dna === 'shadow' ? 1.25 : render.dna === 'iron' ? 0.9 : 1.05;
+          const maxBank = WORM_BANK_MAX * classMul;
+          const bankTarget = clamp(-turnRate / WORM_BANK_TURN_RATE_FOR_MAX, -1, 1) * maxBank;
+          render.bank = lerp(render.bank, bankTarget, smoothFactor(WORM_BANK_K, dt));
+
+          tmpDir.set(dx, 0, dy).normalize();
           render.head.quaternion.setFromUnitVectors(forward, tmpDir);
+          if (Math.abs(render.bank) > 0.0001) {
+            tmpQuat.setFromAxisAngle(tmpDir, render.bank);
+            render.head.quaternion.premultiply(tmpQuat);
+          }
+          headDirOk = true;
+        } else {
+          render.headingValid = false;
         }
+      }
+      if (!headDirOk) {
+        render.bank = lerp(render.bank, 0, smoothFactor(WORM_BANK_K, dt));
       }
       render.head.position.set(head.x, headBase * 0.95, head.y);
       const chew = render.eatFx > 0 ? Math.sin((1 - render.eatFx) * Math.PI) : 0;
@@ -3641,6 +4505,77 @@ async function main() {
           headBase * 0.95 * (1 - chew * 0.07),
           headBase * 1.15 * (1 + chew * 0.26),
         );
+      }
+
+      // Class parts: Shadow scarf (Cyber Ninja) & Arcana rune circle (Mage).
+      if (render.scarf) {
+        const scarfActive = render.dna === 'shadow' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        render.scarf.visible = scarfActive;
+        if (scarfActive) {
+          let fx = 1;
+          let fz = 0;
+          if (neck) {
+            const dx = head.x - neck.x;
+            const dz = head.y - neck.y;
+            const d2 = dx * dx + dz * dz;
+            if (d2 > 0.001) {
+              const inv = 1 / Math.sqrt(d2);
+              fx = dx * inv;
+              fz = dz * inv;
+            }
+          }
+
+          const sx = -fz;
+          const sz = fx;
+          const swayBase = (0.26 + (boostingVisual ? 0.06 : 0)) * headBase;
+          const sway = Math.sin(t * 2.35 + render.skinOffset * 14.0) * swayBase;
+          const jitter = Math.sin(t * 9.2 + render.skinOffset * 31.0) * headBase * 0.05;
+
+          render.scarf.quaternion.copy(render.head.quaternion);
+          render.scarf.position.set(
+            head.x - fx * headBase * 0.42 + sx * (sway + jitter),
+            headBase * 1.22 +
+              Math.sin(t * 6.8 + render.skinOffset * 11.0) * headBase * 0.12 +
+              Math.sin(t * 11.5 + render.skinOffset * 21.0) * headBase * 0.05,
+            head.y - fz * headBase * 0.42 + sz * (sway + jitter),
+          );
+          render.scarf.rotateX(-0.44 + Math.sin(t * 2.25 + render.skinOffset * 10.0) * 0.22);
+          render.scarf.rotateY(
+            Math.sin(t * 1.6 + render.skinOffset * 9.0) * 0.2 + Math.sin(t * 4.8 + render.skinOffset * 17.0) * 0.07,
+          );
+          render.scarf.rotateZ(Math.sin(t * 1.35 + render.skinOffset * 12.0) * 0.14);
+
+          const scarfScale = headBase * (boostingVisual ? 0.92 : 0.84);
+          render.scarf.scale.set(scarfScale, scarfScale, scarfScale);
+
+          const mat = render.scarf.material as THREE.MeshBasicMaterial;
+          mat.color.setHex(shadowNeon);
+          mat.opacity = clamp((boostingVisual ? 0.66 : 0.5) * spawnAlpha * visMul, 0, 0.85);
+
+          const intensity = clamp((boostingVisual ? 1 : 0.55) + (Math.abs(render.bank) / WORM_BANK_MAX) * 0.35, 0, 1);
+          animateScarf(render.scarf, t, render.skinOffset, intensity);
+        }
+      }
+
+      if (render.magicCircle) {
+        const magicActive = render.dna === 'magnetic' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        render.magicCircle.visible = magicActive;
+        if (magicActive) {
+          render.magicCircle.position.set(head.x, 0.035, head.y);
+          const spin = -t * (singularity ? 1.85 : 1.2) + render.skinOffset * 12.0;
+          const tiltBase = singularity ? 0.26 : 0.18;
+          const tiltWobble = singularity ? 0.08 : 0.05;
+          const tilt = tiltBase + tiltWobble * Math.sin(t * 1.15 + render.skinOffset * 6.0 + length * 0.03);
+          render.magicCircle.rotation.set(tilt, spin, tilt * 0.65);
+          const pulse = 1 + 0.06 * Math.sin(t * 3.1 + render.skinOffset * 8.0 + length * 0.02);
+          const mcScale = headBase * (singularity ? 4.6 : 3.7) * pulse;
+          render.magicCircle.scale.set(mcScale, mcScale, mcScale);
+
+          const mat = render.magicCircle.material as THREE.MeshBasicMaterial;
+          const c = mixColor(0xe0ffff, 0xff007f, 0.5 + 0.5 * Math.sin(t * 1.1 + length * 0.05 + render.skinOffset * 6));
+          mat.color.setHex(c);
+          mat.opacity = clamp((0.18 + (singularity ? 0.07 : 0)) * spawnAlpha, 0, 0.42);
+        }
       }
 
       // Body (organic tube via overlapping instanced segments)
@@ -3689,64 +4624,70 @@ async function main() {
           render.body.setMatrixAt(i, tmpObj.matrix);
           tmpColor.setHex(0x000000);
           render.body.setColorAt(i, tmpColor);
-
-          if (render.dna === 'shadow') {
-            render.spine.setMatrixAt(i, tmpObj.matrix);
-            render.spine.setColorAt(i, tmpColor);
-          }
           continue;
         }
         tmpDir.multiplyScalar(1 / dist);
 
         const segR = (ra + rb) * 0.5;
-        const shapeX = render.dna === 'iron' ? 1.15 : render.dna === 'shadow' ? 0.82 : 1.02;
-        const shapeZ = render.dna === 'iron' ? 1.05 : render.dna === 'shadow' ? 0.78 : 1.02;
+        let shapeX = render.dna === 'iron' ? 1.18 : render.dna === 'shadow' ? 0.76 : 1.02;
+        let shapeZ = render.dna === 'iron' ? 1.06 : render.dna === 'shadow' ? 0.68 : 1.02;
+
+        // Full Metal: vary plate thickness per segment so it reads as layered armor.
+        let plateShade = 1;
+        if (render.dna === 'iron') {
+          const step = (i + Math.floor(render.skinOffset * 1000)) % 3;
+          const plate = step === 0 ? 1.32 : step === 1 ? 1.12 : 1.24;
+          const micro = 1 + 0.06 * Math.sin(i * 0.9 + render.skinOffset * 12.0);
+          const mul = plate * micro;
+          shapeX *= mul;
+          shapeZ *= mul * 0.95;
+          plateShade = step === 1 ? 0.92 : step === 2 ? 0.98 : 1.06;
+        }
 
         let segColor: number;
         if (render.dna === 'magnetic') {
-          // Slime reads best with a smooth gradient (avoid "chain" banding).
-          const phase = t * 1.35 - fMid * 10.0 + render.skinOffset * 8.0;
+          // Arcana/Cosmic: deep space base + nebula waves + star speckles.
+          const phase = t * 1.15 - fMid * 10.0 + render.skinOffset * 8.0;
           const blend = 0.5 + 0.5 * Math.sin(phase);
-          segColor = mixColor(magneticGreen, magneticYellow, 0.25 + blend * 0.65);
-          segColor = mixColor(segColor, palette[1] ?? magneticGreen, 0.18);
-          const speck = 0.5 + 0.5 * Math.sin(t * 3.1 + fMid * 14.0 + render.skinOffset * 10.0);
-          segColor = mixColor(segColor, palette[palette.length - 1] ?? 0xa55cff, speck * 0.08);
+          segColor = mixColor(mageBase, mageNebula, 0.18 + blend * 0.58);
+          const speck = 0.5 + 0.5 * Math.sin(t * 3.2 + fMid * 14.0 + render.skinOffset * 10.0);
+          segColor = mixColor(segColor, mageStar, speck * 0.16);
         } else {
           const scroll = render.dna === 'shadow' ? t * 6.0 : 0;
           const band = Math.floor((i + scroll + render.skinOffset * 1000) / stripe);
           segColor = palette[((band % palette.length) + palette.length) % palette.length]!;
         }
         segColor = shade(segColor, 0.88 + 0.22 * (1 - fMid));
+        if (render.dna === 'iron') segColor = shade(segColor, plateShade);
         if (boostingVisual) segColor = shade(segColor, render.dna === 'shadow' ? 1.12 : 1.06);
         if (siege) segColor = mixColor(segColor, 0xff3b2f, 0.28);
         if (singularity && render.dna === 'magnetic') {
-          const swirl = 0.22 + 0.12 * Math.sin(t * 2.6 + fMid * 10.0);
-          segColor = mixColor(segColor, 0xa55cff, swirl);
+          const swirl = 0.18 + 0.18 * Math.sin(t * 2.6 + fMid * 10.0);
+          segColor = mixColor(segColor, mageNebula, swirl);
         }
 
         tmpObj.position.set((ax + bx) * 0.5, (ay + by) * 0.5, (az + bz) * 0.5);
         tmpObj.quaternion.setFromUnitVectors(up, tmpDir);
+        if (render.bank !== 0) {
+          const w = 1 - fMid;
+          const roll = render.bank * w * w;
+          if (Math.abs(roll) > 0.0001) {
+            tmpQuat.setFromAxisAngle(tmpDir, roll);
+            tmpObj.quaternion.premultiply(tmpQuat);
+          }
+        }
         tmpObj.scale.set(segR * shapeX, dist * lengthMul, segR * shapeZ);
         tmpObj.updateMatrix();
         render.body.setMatrixAt(i, tmpObj.matrix);
         tmpColor.setHex(segColor);
         render.body.setColorAt(i, tmpColor);
-
-        if (render.dna === 'shadow') {
-          const spineColor = mixColor(segColor, shadowNeon, 0.72);
-          tmpObj.scale.set(segR * spineMul, dist * 1.02, segR * spineMul);
-          tmpObj.updateMatrix();
-          render.spine.setMatrixAt(i, tmpObj.matrix);
-          tmpColor.setHex(spineColor);
-          render.spine.setColorAt(i, tmpColor);
-        }
       }
 
       render.body.count = bodyCount;
       render.body.instanceMatrix.needsUpdate = true;
       if (render.body.instanceColor) render.body.instanceColor.needsUpdate = true;
 
-      render.spine.count = render.dna === 'shadow' ? bodyCount : 0;
+      render.spine.count = 0;
       render.spine.instanceMatrix.needsUpdate = true;
       if (render.spine.instanceColor) render.spine.instanceColor.needsUpdate = true;
 
@@ -3783,13 +4724,19 @@ async function main() {
       const palette = render.skinPalette.length > 0 ? render.skinPalette : [render.color];
       const stripe = Math.max(1, render.skinStripe);
 
-      const ironGun = palette[0] ?? 0x2c3642;
-      const ironOrange = palette[2] ?? 0xe07b39;
-      const magneticGreen = palette[0] ?? 0x8cff00;
-      const magneticYellow = palette[2] ?? 0xfff15a;
+      const ironSteel = palette[0] ?? 0xf0f4f8;
+      const ironJoint = palette[2] ?? 0x2b303b;
+      const ironAccent = palette[4] ?? 0xffd700;
+
+      const mageBase = palette[0] ?? 0x191970;
+      const mageNebula = palette[2] ?? 0xff007f;
+      const mageStar = palette[4] ?? 0xe0ffff;
+
+      const shadowNeonA = palette[3] ?? 0x00e5ff;
+      const shadowNeonB = palette[5] ?? 0xb000ff;
       const shadowNeon = mixColor(
-        0x00e5ff,
-        0xb000ff,
+        shadowNeonA,
+        shadowNeonB,
         0.5 + 0.5 * Math.sin(t * 2.05 + length * 0.06 + render.skinOffset * 7.0),
       );
 
@@ -3799,14 +4746,14 @@ async function main() {
       const bodyOpacity = render.dna === 'shadow' ? opacity * 0.78 : opacity;
 
       if (render.dna === 'iron') {
-        render.material.metalness = 0.72;
-        render.material.roughness = 0.78;
+        render.material.metalness = 0.88;
+        render.material.roughness = 0.46;
       } else if (render.dna === 'shadow') {
-        render.material.metalness = 0.0;
-        render.material.roughness = 0.18;
+        render.material.metalness = 0.05;
+        render.material.roughness = 0.42;
       } else {
         render.material.metalness = 0.0;
-        render.material.roughness = 0.28;
+        render.material.roughness = 0.22;
       }
 
       render.material.opacity = bodyOpacity;
@@ -3823,8 +4770,16 @@ async function main() {
       if (render.dna === 'iron') {
         const primary = render.headMaterials[0];
         const accent = render.headMaterials[1];
-        if (primary) primary.color.setHex(ironGun);
-        if (accent) accent.color.setHex(ironOrange);
+        if (primary) {
+          primary.color.setHex(ironSteel);
+          primary.metalness = 0.8;
+          primary.roughness = 0.46;
+        }
+        if (accent) {
+          accent.color.setHex(ironAccent);
+          accent.metalness = 0.75;
+          accent.roughness = 0.4;
+        }
       } else if (render.dna === 'shadow') {
         const outer = render.headMaterials[0];
         const inner = render.headMaterials[1];
@@ -3835,10 +4790,21 @@ async function main() {
           inner.emissiveIntensity = clamp(0.85 * shimmer * spawnAlpha, 0, 1.4);
         }
       } else {
-        const primary = render.headMaterials[0];
-        const mouth = render.headMaterials[1];
-        if (primary) primary.color.setHex(magneticGreen);
-        if (mouth) mouth.color.setHex(magneticYellow);
+        const orb = render.headMaterials[0];
+        const rune = render.headMaterials[1];
+        if (orb) {
+          const depth = 0.55 + 0.45 * Math.sin(t * 0.9 + length * 0.03 + render.skinOffset * 7.0);
+          orb.color.setHex(mixColor(mageBase, mageNebula, depth * 0.22));
+          orb.emissive.setHex(mixColor(mageStar, mageNebula, 0.26));
+          orb.emissiveIntensity = clamp(0.04 * shimmer * spawnAlpha, 0, 0.1);
+        }
+        if (rune) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.05 + length * 0.02 + render.skinOffset * 6.0);
+          const c = mixColor(mageNebula, mageStar, 0.3 + pulse * 0.55);
+          rune.color.setHex(c);
+          rune.emissive.setHex(c);
+          rune.emissiveIntensity = clamp(0.75 * shimmer * spawnAlpha, 0, 1.8);
+        }
       }
 
       const headOpacity = render.dna === 'shadow' ? clamp(bodyOpacity + 0.12, 0, 1) : bodyOpacity;
@@ -3848,17 +4814,11 @@ async function main() {
         m.depthWrite = false;
       }
 
-      if (render.dna === 'shadow') {
-        render.spineMaterial.opacity = clamp(bodyOpacity * 0.7, 0, 0.65);
-        render.spineMaterial.transparent = true;
-        render.spineMaterial.depthWrite = false;
-        render.spineMaterial.emissive.setHex(shadowNeon);
-        render.spineMaterial.emissiveIntensity = clamp(0.85 * shimmer * spawnAlpha, 0, 1.5);
-      } else {
-        render.spineMaterial.opacity = 0;
-        render.spineMaterial.emissive.setHex(0x000000);
-        render.spineMaterial.emissiveIntensity = 0.0;
-      }
+      render.spineMaterial.opacity = 0;
+      render.spineMaterial.transparent = true;
+      render.spineMaterial.depthWrite = false;
+      render.spineMaterial.emissive.setHex(0x000000);
+      render.spineMaterial.emissiveIntensity = 0.0;
 
       const shadowMat = render.shadow.material as THREE.MeshBasicMaterial;
       render.shadow.position.set(head.x, 0.02, head.y);
@@ -3869,20 +4829,47 @@ async function main() {
       const auraMat = render.aura.material as THREE.MeshBasicMaterial;
       render.aura.position.set(head.x, 0.03, head.y);
       render.aura.rotation.z = t * (render.dna === 'shadow' ? 2.2 : render.dna === 'magnetic' ? 1.4 : 0.9) + length * 0.01;
-      const auraColor = render.dna === 'iron' ? ironOrange : render.dna === 'shadow' ? shadowNeon : magneticGreen;
-      const auraScale = headBase * (render.dna === 'magnetic' ? 2.8 : 2.3);
+      const auraColor = render.dna === 'iron' ? ironAccent : render.dna === 'shadow' ? shadowNeon : mageNebula;
+      const auraScale = headBase * (render.dna === 'magnetic' ? 3.1 : 2.3);
       auraMat.color.setHex(auraColor);
       auraMat.opacity = clamp(0.09 * shimmer * spawnAlpha, 0, 0.35);
       render.aura.scale.set(auraScale, auraScale, auraScale);
       render.aura.visible = auraMat.opacity > 0.01;
 
       const neck = render.segs[1] ?? render.targetSegs[1];
+      let headDirOk = false;
       if (neck) {
-        tmpDir.set(head.x - neck.x, 0, head.y - neck.y);
-        if (tmpDir.lengthSq() > 0.001) {
-          tmpDir.normalize();
+        const dx = head.x - neck.x;
+        const dy = head.y - neck.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0.001) {
+          const headingNow = Math.atan2(dy, dx);
+          const prev = render.headingValid ? render.heading : headingNow;
+          const dHeading = normalizeAngle(headingNow - prev);
+          render.heading = headingNow;
+          render.headingValid = true;
+
+          const safeDt = Math.max(dt, 1 / 120);
+          const turnRate = dHeading / safeDt;
+
+          const classMul = render.dna === 'shadow' ? 1.25 : render.dna === 'iron' ? 0.9 : 1.05;
+          const maxBank = WORM_BANK_MAX * classMul;
+          const bankTarget = clamp(-turnRate / WORM_BANK_TURN_RATE_FOR_MAX, -1, 1) * maxBank;
+          render.bank = lerp(render.bank, bankTarget, smoothFactor(WORM_BANK_K, dt));
+
+          tmpDir.set(dx, 0, dy).normalize();
           render.head.quaternion.setFromUnitVectors(forward, tmpDir);
+          if (Math.abs(render.bank) > 0.0001) {
+            tmpQuat.setFromAxisAngle(tmpDir, render.bank);
+            render.head.quaternion.premultiply(tmpQuat);
+          }
+          headDirOk = true;
+        } else {
+          render.headingValid = false;
         }
+      }
+      if (!headDirOk) {
+        render.bank = lerp(render.bank, 0, smoothFactor(WORM_BANK_K, dt));
       }
       render.head.position.set(head.x, headBase * 0.95, head.y);
       const chew = render.eatFx > 0 ? Math.sin((1 - render.eatFx) * Math.PI) : 0;
@@ -3904,6 +4891,76 @@ async function main() {
           headBase * 0.95 * (1 - chew * 0.07),
           headBase * 1.12 * (1 + chew * 0.26),
         );
+      }
+
+      if (render.scarf) {
+        const scarfActive = render.dna === 'shadow' && opacity > 0.02;
+        render.scarf.visible = scarfActive;
+        if (scarfActive) {
+          let fx = 1;
+          let fz = 0;
+          if (neck) {
+            const dx = head.x - neck.x;
+            const dz = head.y - neck.y;
+            const d2 = dx * dx + dz * dz;
+            if (d2 > 0.001) {
+              const inv = 1 / Math.sqrt(d2);
+              fx = dx * inv;
+              fz = dz * inv;
+            }
+          }
+
+          const sx = -fz;
+          const sz = fx;
+          const swayBase = headBase * 0.22;
+          const sway = Math.sin(t * 2.25 + render.skinOffset * 12.0) * swayBase;
+          const jitter = Math.sin(t * 8.4 + render.skinOffset * 27.0) * headBase * 0.04;
+
+          render.scarf.quaternion.copy(render.head.quaternion);
+          render.scarf.position.set(
+            head.x - fx * headBase * 0.38 + sx * (sway + jitter),
+            headBase * 1.16 +
+              Math.sin(t * 6.4 + render.skinOffset * 9.0) * headBase * 0.1 +
+              Math.sin(t * 10.8 + render.skinOffset * 19.0) * headBase * 0.04,
+            head.y - fz * headBase * 0.38 + sz * (sway + jitter),
+          );
+          render.scarf.rotateX(-0.42 + Math.sin(t * 2.05 + render.skinOffset * 8.0) * 0.2);
+          render.scarf.rotateY(
+            Math.sin(t * 1.5 + render.skinOffset * 11.0) * 0.18 + Math.sin(t * 4.6 + render.skinOffset * 15.0) * 0.06,
+          );
+          render.scarf.rotateZ(Math.sin(t * 1.25 + render.skinOffset * 10.0) * 0.12);
+
+          const scarfScale = headBase * 0.82;
+          render.scarf.scale.set(scarfScale, scarfScale, scarfScale);
+
+          const mat = render.scarf.material as THREE.MeshBasicMaterial;
+          mat.color.setHex(shadowNeon);
+          mat.opacity = clamp(0.52 * shimmer * spawnAlpha, 0, 0.75);
+
+          const intensity = clamp(0.55 + (Math.abs(render.bank) / WORM_BANK_MAX) * 0.35, 0, 1);
+          animateScarf(render.scarf, t, render.skinOffset, intensity);
+        }
+      }
+
+      if (render.magicCircle) {
+        const magicActive = render.dna === 'magnetic' && opacity > 0.02;
+        render.magicCircle.visible = magicActive;
+        if (magicActive) {
+          render.magicCircle.position.set(head.x, 0.035, head.y);
+          const spin = -t * 1.15 + render.skinOffset * 12.0;
+          const tiltBase = 0.18;
+          const tiltWobble = 0.05;
+          const tilt = tiltBase + tiltWobble * Math.sin(t * 1.1 + render.skinOffset * 6.0 + length * 0.03);
+          render.magicCircle.rotation.set(tilt, spin, tilt * 0.65);
+          const pulse = 1 + 0.06 * Math.sin(t * 3.0 + render.skinOffset * 8.0 + length * 0.02);
+          const mcScale = headBase * 3.35 * pulse;
+          render.magicCircle.scale.set(mcScale, mcScale, mcScale);
+
+          const mat = render.magicCircle.material as THREE.MeshBasicMaterial;
+          const c = mixColor(0xe0ffff, 0xff007f, 0.5 + 0.5 * Math.sin(t * 1.05 + length * 0.05 + render.skinOffset * 6));
+          mat.color.setHex(c);
+          mat.opacity = clamp(0.16 * shimmer * spawnAlpha, 0, 0.35);
+        }
       }
 
       const segs = render.segs.length > 0 ? render.segs : render.targetSegs;
@@ -3954,32 +5011,39 @@ async function main() {
           render.body.setMatrixAt(i, tmpObj.matrix);
           tmpColor.setHex(0x000000);
           render.body.setColorAt(i, tmpColor);
-          if (render.dna === 'shadow') {
-            render.spine.setMatrixAt(i, tmpObj.matrix);
-            render.spine.setColorAt(i, tmpColor);
-          }
           continue;
         }
         tmpDir.multiplyScalar(1 / dist);
 
         const segR = (ra + rb) * 0.5;
-        const shapeX = render.dna === 'iron' ? 1.15 : render.dna === 'shadow' ? 0.82 : 1.02;
-        const shapeZ = render.dna === 'iron' ? 1.05 : render.dna === 'shadow' ? 0.78 : 1.02;
+        let shapeX = render.dna === 'iron' ? 1.18 : render.dna === 'shadow' ? 0.76 : 1.02;
+        let shapeZ = render.dna === 'iron' ? 1.06 : render.dna === 'shadow' ? 0.68 : 1.02;
+
+        let plateShade = 1;
+        if (render.dna === 'iron') {
+          const step = (i + Math.floor(render.skinOffset * 1000)) % 3;
+          const plate = step === 0 ? 1.3 : step === 1 ? 1.1 : 1.22;
+          const micro = 1 + 0.06 * Math.sin(i * 0.9 + render.skinOffset * 12.0);
+          const mul = plate * micro;
+          shapeX *= mul;
+          shapeZ *= mul * 0.95;
+          plateShade = step === 1 ? 0.92 : step === 2 ? 0.98 : 1.06;
+        }
 
         let segColor: number;
         if (render.dna === 'magnetic') {
-          const phase = t * 1.35 - fMid * 10.0 + render.skinOffset * 8.0;
+          const phase = t * 1.15 - fMid * 10.0 + render.skinOffset * 8.0;
           const blend = 0.5 + 0.5 * Math.sin(phase);
-          segColor = mixColor(magneticGreen, magneticYellow, 0.25 + blend * 0.65);
-          segColor = mixColor(segColor, palette[1] ?? magneticGreen, 0.18);
-          const speck = 0.5 + 0.5 * Math.sin(t * 3.1 + fMid * 14.0 + render.skinOffset * 10.0);
-          segColor = mixColor(segColor, palette[palette.length - 1] ?? 0xa55cff, speck * 0.08);
+          segColor = mixColor(mageBase, mageNebula, 0.18 + blend * 0.58);
+          const speck = 0.5 + 0.5 * Math.sin(t * 3.2 + fMid * 14.0 + render.skinOffset * 10.0);
+          segColor = mixColor(segColor, mageStar, speck * 0.16);
         } else {
           const scroll = render.dna === 'shadow' ? t * 6.0 : 0;
           const band = Math.floor((i + scroll + render.skinOffset * 1000) / stripe);
           segColor = palette[((band % palette.length) + palette.length) % palette.length]!;
         }
         segColor = shade(segColor, (0.84 + 0.2 * (1 - fMid)) * (0.92 + shimmer * 0.12));
+        if (render.dna === 'iron') segColor = shade(segColor, plateShade);
 
         let midX = (ax + bx) * 0.5;
         let midZ = (az + bz) * 0.5;
@@ -4004,40 +5068,35 @@ async function main() {
 
         tmpObj.position.set(midX, (ay + by) * 0.5, midZ);
         tmpObj.quaternion.setFromUnitVectors(up, tmpDir);
+        if (render.bank !== 0) {
+          const w = 1 - fMid;
+          const roll = render.bank * w * w;
+          if (Math.abs(roll) > 0.0001) {
+            tmpQuat.setFromAxisAngle(tmpDir, roll);
+            tmpObj.quaternion.premultiply(tmpQuat);
+          }
+        }
         tmpObj.scale.set(segR * shapeX, dist * lengthMul, segR * shapeZ);
         tmpObj.updateMatrix();
         render.body.setMatrixAt(i, tmpObj.matrix);
         tmpColor.setHex(segColor);
         render.body.setColorAt(i, tmpColor);
-
-        if (render.dna === 'shadow') {
-          const spineColor = mixColor(segColor, shadowNeon, 0.72);
-          tmpObj.scale.set(segR * spineMul, dist * 1.02, segR * spineMul);
-          tmpObj.updateMatrix();
-          render.spine.setMatrixAt(i, tmpObj.matrix);
-          tmpColor.setHex(spineColor);
-          render.spine.setColorAt(i, tmpColor);
-        }
       }
 
       render.body.count = bodyCount;
       render.body.instanceMatrix.needsUpdate = true;
       if (render.body.instanceColor) render.body.instanceColor.needsUpdate = true;
 
-      render.spine.count = render.dna === 'shadow' ? bodyCount : 0;
+      render.spine.count = 0;
       render.spine.instanceMatrix.needsUpdate = true;
       if (render.spine.instanceColor) render.spine.instanceColor.needsUpdate = true;
 
-      render.nameSprite.position.set(head.x, headBase * 2.05, head.y);
-      const camDist = Math.hypot(head.x - camera.x, head.y - camera.y);
-      const baseNameAlpha = clamp(1 - camDist / 1800, 0.15, 1);
-      const nameMat = render.nameSprite.material as THREE.SpriteMaterial;
-      nameMat.opacity = baseNameAlpha * opacity * 0.85;
-      render.nameSprite.visible = nameMat.opacity > 0.02;
+      // Decoys don't need nameplates (keeps the read clean and saves work).
+      render.nameSprite.visible = false;
     }
 
     // Minimap (10fps)
-    if (minimapEl && minimapCtx) {
+    if (latestState && minimapEl && minimapCtx) {
       minimapAcc += dt;
       if (minimapAcc >= 0.1) {
         minimapAcc = 0;
@@ -4073,6 +5132,7 @@ async function main() {
 
         // Players
         for (const [id, render] of playerRenders) {
+          if (id === LOBBY_PREVIEW_ID) continue;
           if (id !== myId && (render.stealth || render.phase)) continue;
           const head = render.segs[0] ?? render.targetSegs[0];
           if (!head) continue;

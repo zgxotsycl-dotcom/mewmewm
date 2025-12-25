@@ -116,9 +116,62 @@ interface Player {
   boostBlend: number;
   boostDrain: number;
   growthAcc: number;
+  growthApplyAcc: number;
   spawnedAt: number;
   isBot: boolean;
   ai?: BotBrain;
+}
+
+class SpatialGrid<T> {
+  private readonly cells: Map<string, Set<T>> = new Map();
+
+  constructor(private readonly cellSize: number) {}
+
+  // Convert coordinates to a grid key ("10,20").
+  private getKey(x: number, y: number): string {
+    const cx = Math.floor(x / this.cellSize);
+    const cy = Math.floor(y / this.cellSize);
+    return `${cx},${cy}`;
+  }
+
+  add(obj: T, x: number, y: number): void {
+    const key = this.getKey(x, y);
+    let cell = this.cells.get(key);
+    if (!cell) {
+      cell = new Set();
+      this.cells.set(key, cell);
+    }
+    cell.add(obj);
+  }
+
+  remove(obj: T, x: number, y: number): void {
+    const key = this.getKey(x, y);
+    const cell = this.cells.get(key);
+    if (!cell) return;
+    cell.delete(obj);
+    if (cell.size <= 0) this.cells.delete(key);
+  }
+
+  // Get objects from the surrounding 9 cells (including the current one).
+  getNearby(x: number, y: number): T[] {
+    const out: T[] = [];
+    const cx = Math.floor(x / this.cellSize);
+    const cy = Math.floor(y / this.cellSize);
+
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const key = `${cx + dx},${cy + dy}`;
+        const cell = this.cells.get(key);
+        if (!cell) continue;
+        for (const obj of cell) out.push(obj);
+      }
+    }
+    return out;
+  }
+
+  clear(): void {
+    this.cells.clear();
+  }
 }
 
 // World config is still rectangular for client/minimap math, but the arena is a circle centered at (0, 0).
@@ -134,6 +187,10 @@ const BODY_RADIUS = 14;
 const TRAIL_POINT_MIN_DIST = 1; // 3에서 1로 변경하여 기록 해상도를 높임
 const TRAIL_BUFFER_DIST = 2400;
 const TRAIL_COMPACT_THRESHOLD = 2048;
+
+// Network quantization:
+// Keep payload size reasonable while still sending enough precision for smooth interpolation.
+const NET_POS_SCALE = 100; // 2 decimals (0.01 world-units)
 
 // Speeds are in world-units per second (movement uses dt).
 const BASE_SPEED = 126;
@@ -157,6 +214,19 @@ const FOOD_VALUE_WEIGHTS: Array<{ value: number; weight: number }> = [
   { value: 2, weight: 0.18 },
   { value: 3, weight: 0.04 },
 ];
+
+// Growth tuning:
+// - Keep per-food growth "micro" so worms lengthen smoothly instead of jumping.
+// - Corpse food is still better than normal, but never grants multiple segments at once.
+const FOOD_GROWTH_PER_VALUE = 0.2;
+const CORPSE_GROWTH_PER_VALUE = 0.32;
+const GROWTH_APPLY_RATE = 6; // segments per second (throttles queued growth)
+
+// Magnetic passive: gently pull nearby food toward the head (slither.io-style).
+const MAGNET_PULL_RADIUS = 520;
+const MAGNET_PULL_RADIUS_SINGULARITY = 1080;
+const MAGNET_PULL_MIN_SPEED = 90; // ensures visible movement even with integer food netpos
+const MAGNET_PULL_MAX_SPEED = 1850;
 
 const SPAWN_INVULNERABLE_MS = 1500;
 const SHADOW_STEALTH_MS = 1000;
@@ -187,6 +257,15 @@ const BAIT_BOMB_INTERVAL_MS = 1200;
 const players = new Map<string, Player>();
 const foods = new Map<string, Food>();
 let nextFoodId = 1;
+
+// Spatial grids rebuilt every tick (cell size slightly larger than a typical view chunk).
+const GRID_CELL_SIZE = 300;
+const PLAYER_GRID_SKIP_NECK = 6;
+const PLAYER_GRID_SAMPLE_STEP = 2; // keep collision reliable (segment spacing=12, sampling=24)
+
+const foodGrid = new SpatialGrid<Food>(GRID_CELL_SIZE);
+type PlayerBodySample = { seg: Vec2; playerId: string };
+const playerGrid = new SpatialGrid<PlayerBodySample>(GRID_CELL_SIZE);
 
 type GasCloud = { id: string; x: number; y: number; r: number; expiresAt: number };
 const gasClouds = new Map<string, GasCloud>();
@@ -235,6 +314,10 @@ function rand(min: number, max: number): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function netPos(value: number): number {
+  return Math.round(value * NET_POS_SCALE) / NET_POS_SCALE;
 }
 
 function normalizeAngle(angle: number): number {
@@ -749,10 +832,40 @@ function applyTrailToSegments(player: Player): void {
     return;
   }
 
+  // Precision polish: treat the *current* head position as an implicit trail point.
+  // When per-tick movement is < TRAIL_POINT_MIN_DIST, updateHeadTrail won't push a new point,
+  // which can cause a tiny "neck stretch" between seg[0] (head) and seg[1] (body).
+  // Including the head as a temporary point keeps segment spacing exact without bloating the trail.
+  const head = segs[0]!;
+
   let segIndex = 1;
   let targetDist = SEGMENT_SPACING;
   let acc = 0;
-  let cur = trail[end]!;
+  const last = trail[end]!;
+
+  // Segment: head -> last recorded trail point
+  let cur: Vec2 = head;
+  {
+    const dx = cur.x - last.x;
+    const dy = cur.y - last.y;
+    const segLen = Math.sqrt(dx * dx + dy * dy);
+    if (segLen > 0.001) {
+      while (segIndex < segs.length && acc + segLen >= targetDist) {
+        const t = (targetDist - acc) / segLen;
+        const px = cur.x + (last.x - cur.x) * t;
+        const py = cur.y + (last.y - cur.y) * t;
+        const seg = segs[segIndex]!;
+        seg.x = px;
+        seg.y = py;
+        segIndex++;
+        targetDist += SEGMENT_SPACING;
+      }
+
+      acc += segLen;
+    }
+  }
+
+  cur = last;
 
   for (let idx = end; idx > start && segIndex < segs.length; idx--) {
     const prev = trail[idx - 1]!;
@@ -1167,6 +1280,7 @@ function createPlayer(
     boostBlend: 0,
     boostDrain: 0,
     growthAcc: 0,
+    growthApplyAcc: 0,
     spawnedAt: Date.now(),
     isBot: options?.isBot ?? false,
   };
@@ -1222,6 +1336,7 @@ function resetPlayerForLobbyChoice(player: Player, dna: WormClass): void {
   player.boostBlend = 0;
   player.boostDrain = 0;
   player.growthAcc = 0;
+  player.growthApplyAcc = 0;
 }
 
 function grow(player: Player, amount: number): void {
@@ -1231,6 +1346,21 @@ function grow(player: Player, amount: number): void {
   for (let i = 0; i < amount; i++) {
     player.segments.push({ x: tail.x, y: tail.y });
   }
+}
+
+function applyQueuedGrowth(player: Player): void {
+  if (player.growthAcc < 1) {
+    player.growthApplyAcc = 0;
+    return;
+  }
+
+  player.growthApplyAcc += GROWTH_APPLY_RATE * DT;
+  if (player.growthApplyAcc < 1) return;
+
+  // Apply at most 1 segment per tick for smoothness.
+  player.growthApplyAcc -= 1;
+  player.growthAcc -= 1;
+  grow(player, 1);
 }
 
 function initBot(id: string): Player {
@@ -1519,6 +1649,9 @@ function stepPlayer(player: Player, now: number): boolean {
     player.massDecayAcc = 0;
   }
 
+  // Apply queued growth smoothly (throttled), so food doesn't cause big one-frame length jumps.
+  applyQueuedGrowth(player);
+
   trimTrail(player);
   return true;
 }
@@ -1534,11 +1667,45 @@ function tryEatFood(player: Player, now: number): void {
   if (now < player.magnetUntil) eatR *= 4;
   const eatR2 = eatR * eatR;
 
-  for (const food of foods.values()) {
-    const d2 = dist2(head, food);
-    if (d2 > eatR2) continue;
+  const magneticPull = player.dna === 'magnetic';
+  const pullR = magneticPull
+    ? isSingularityActive(player, now)
+      ? MAGNET_PULL_RADIUS_SINGULARITY
+      : MAGNET_PULL_RADIUS
+    : 0;
+  const pullR2 = pullR * pullR;
+
+  const nearbyFoods = foodGrid.getNearby(head.x, head.y);
+  for (const food of nearbyFoods) {
+    if (!foods.has(food.id)) continue; // may have been eaten earlier this tick
+
+    // Magnetic passive: pull nearby food toward the head before the eat check.
+    if (magneticPull && food.kind !== 'bomb') {
+      const dx = head.x - food.x;
+      const dy = head.y - food.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 0.001 && d2 <= pullR2) {
+        const d = Math.sqrt(d2) || 1;
+        const t = clamp(1 - d / pullR, 0, 1);
+        const strength = t * t;
+        const speed = MAGNET_PULL_MIN_SPEED + (MAGNET_PULL_MAX_SPEED - MAGNET_PULL_MIN_SPEED) * strength;
+        const step = Math.min(d, speed * DT);
+
+        const oldX = food.x;
+        const oldY = food.y;
+        const moved = clampToArena({ x: food.x + (dx / d) * step, y: food.y + (dy / d) * step }, food.r + 6);
+        food.x = moved.x;
+        food.y = moved.y;
+        foodGrid.remove(food, oldX, oldY);
+        foodGrid.add(food, food.x, food.y);
+      }
+    }
+
+    const eatD2 = dist2(head, food);
+    if (eatD2 > eatR2) continue;
 
     foods.delete(food.id);
+    foodGrid.remove(food, food.x, food.y);
 
     if (food.kind === 'bomb') {
       player.scoreAcc = Math.max(0, player.scoreAcc - 12);
@@ -1552,14 +1719,9 @@ function tryEatFood(player: Player, now: number): void {
     player.scoreAcc += scoreGain;
     player.score = Math.max(0, Math.floor(player.scoreAcc));
 
-    const growthUnitsBase = food.kind === 'corpse' ? 1.4 + food.value * 2.1 : food.value * 0.33;
+    const growthUnitsBase = food.kind === 'corpse' ? food.value * CORPSE_GROWTH_PER_VALUE : food.value * FOOD_GROWTH_PER_VALUE;
     const growthUnits = growthUnitsBase * (player.hyperMetabolism ? HYPER_METABOLISM_GROWTH_MUL : 1);
     player.growthAcc += growthUnits;
-    const growth = Math.floor(player.growthAcc);
-    if (growth >= 1) {
-      player.growthAcc -= growth;
-      grow(player, growth);
-    }
   }
 }
 
@@ -1637,14 +1799,10 @@ function stepBlackHoles(now: number): void {
         owner.scoreAcc += scoreGain;
         owner.score = Math.max(0, Math.floor(owner.scoreAcc));
 
-        const growthUnitsBase = food.kind === 'corpse' ? 1.4 + food.value * 2.1 : food.value * 0.33;
+        const growthUnitsBase =
+          food.kind === 'corpse' ? food.value * CORPSE_GROWTH_PER_VALUE : food.value * FOOD_GROWTH_PER_VALUE;
         const growthUnits = growthUnitsBase * (owner.hyperMetabolism ? HYPER_METABOLISM_GROWTH_MUL : 1);
         owner.growthAcc += growthUnits;
-        const growth = Math.floor(owner.growthAcc);
-        if (growth >= 1) {
-          owner.growthAcc -= growth;
-          grow(owner, growth);
-        }
         continue;
       }
 
@@ -1791,6 +1949,16 @@ function handleCollisions(now: number): void {
     }
   }
 
+  // Rebuild the body grid after positional adjustments (singularity pull, armor pushes).
+  playerGrid.clear();
+  for (const p of list) {
+    for (let i = PLAYER_GRID_SKIP_NECK; i < p.segments.length; i += PLAYER_GRID_SAMPLE_STEP) {
+      const seg = p.segments[i];
+      if (!seg) continue;
+      playerGrid.add({ seg, playerId: p.id }, seg.x, seg.y);
+    }
+  }
+
   for (const player of list) {
     if (toKill.has(player.id)) continue;
     if (now - player.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
@@ -1803,38 +1971,35 @@ function handleCollisions(now: number): void {
     const head = player.segments[0];
     if (!head) continue;
 
-    for (const other of list) {
-      if (player.id === other.id) continue;
+    const headR = radii.get(player.id)?.head ?? HEAD_RADIUS;
+    const nearbySegments = playerGrid.getNearby(head.x, head.y);
+    for (const entry of nearbySegments) {
+      if (entry.playerId === player.id) continue; // skip self
+
+      const other = players.get(entry.playerId);
+      if (!other) continue;
       if (isPhaseActive(other, now)) continue;
-      const otherSegs = other.segments;
-      const headR = radii.get(player.id)?.head ?? HEAD_RADIUS;
+
       const bodyR = radii.get(other.id)?.body ?? BODY_RADIUS;
       const collisionR = headR * 0.85 + bodyR * 0.95;
       const collisionR2 = collisionR * collisionR;
       const spikedStacks = other.spikedTailStacks;
       const burnR2 = (collisionR * 1.55) * (collisionR * 1.55);
 
-      // Skip the neck area to avoid "spawn-kill" feeling and head overlap.
-      const start = 6;
-      for (let i = start; i < otherSegs.length; i++) {
-        const seg = otherSegs[i];
-        if (!seg) continue;
-        const d2 = dist2(head, seg);
-        if (spikedStacks > 0 && !siege && !voidStrike && !invulnerable && d2 <= burnR2) {
-          player.boostBurnUntil = Math.max(player.boostBurnUntil, now + 450);
-          player.boostBurnStacks = Math.max(player.boostBurnStacks, spikedStacks);
-        }
-        if (d2 <= collisionR2) {
-          if ((siege || voidStrike) && now - other.spawnedAt >= SPAWN_INVULNERABLE_MS && !isInvulnerableActive(other, now)) {
-            toKill.set(other.id, { reason: siege ? '시즈 브레이커' : '보이드 스트라이크', killerDna: player.dna });
-          } else if (!invulnerable) {
-            toKill.set(player.id, { reason: '충돌', killerDna: other.dna });
-          }
+      const d2 = dist2(head, entry.seg);
+      if (spikedStacks > 0 && !siege && !voidStrike && !invulnerable && d2 <= burnR2) {
+        player.boostBurnUntil = Math.max(player.boostBurnUntil, now + 450);
+        player.boostBurnStacks = Math.max(player.boostBurnStacks, spikedStacks);
+      }
+
+      if (d2 <= collisionR2) {
+        if ((siege || voidStrike) && now - other.spawnedAt >= SPAWN_INVULNERABLE_MS && !isInvulnerableActive(other, now)) {
+          toKill.set(other.id, { reason: siege ? '시즈 브레이커' : '보이드 스트라이크', killerDna: player.dna });
+        } else if (!invulnerable) {
+          toKill.set(player.id, { reason: '충돌', killerDna: other.dna });
           break;
         }
       }
-
-      if (toKill.has(player.id)) break;
     }
   }
 
@@ -1901,8 +2066,8 @@ function buildPlayersPayload(now: number): Record<string, PlayerState> {
       skillCdMs: player.skill ? Math.max(0, player.skillCooldownUntil - now) : 0,
       skillActive: player.skill ? now < player.skillActiveUntil : false,
       mutations: player.mutations,
-      // Use sub-pixel precision so movement feels smooth (slither.io style).
-      segments: player.segments.map((s) => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 })),
+      // Use enough precision for smooth, slow movement without bloating payloads.
+      segments: player.segments.map((s) => ({ x: netPos(s.x), y: netPos(s.y) })),
       score: player.score,
     };
   }
@@ -1920,7 +2085,7 @@ function buildDecoysPayload(): DecoyState[] {
       color: decoy.color,
       dna: decoy.dna,
       originalLen: decoy.originalLen,
-      segments: decoy.segments.map((s) => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 })),
+      segments: decoy.segments.map((s) => ({ x: netPos(s.x), y: netPos(s.y) })),
     });
   }
   return out;
@@ -2202,6 +2367,13 @@ for (let i = 0; i < BOT_COUNT; i++) {
 
 setInterval(() => {
   const now = Date.now();
+
+  // Rebuild spatial grids for this tick.
+  foodGrid.clear();
+  playerGrid.clear();
+  for (const food of foods.values()) {
+    foodGrid.add(food, food.x, food.y);
+  }
 
   for (const player of players.values()) {
     if (player.isBot) stepBot(player, now);
