@@ -3485,10 +3485,9 @@ type FoodVisual = {
     sendInput();
   });
 
-  // Allow steering while the mutation picker is open (the overlay may intercept pointer events).
+  // Global steering fallback (some right-click / pointer-capture paths can stop canvas pointermove from firing).
   window.addEventListener('pointermove', (e: PointerEvent) => {
     if (!menu.classList.contains('hidden')) return;
-    if (mutationOverlay.classList.contains('hidden')) return;
     updateTargetAngle(e.clientX, e.clientY);
     sendInput();
   });
@@ -3571,6 +3570,7 @@ type FoodVisual = {
     const rightDown = e.button === 2 || (e.buttons & 2) === 2;
     if (rightDown) {
       lastPointerRightDownAt = performance.now();
+      e.preventDefault();
       if (mutationOpen) return;
       const s = getMySkillState();
       if (!s) return;
@@ -3671,6 +3671,7 @@ type FoodVisual = {
     if (e.button !== 2) return;
     if (!menu.classList.contains('hidden')) return;
     if (performance.now() - lastPointerRightDownAt < RIGHT_CLICK_FALLBACK_MS) return;
+    e.preventDefault();
     if (mutationOpen) return;
 
     const s = getMySkillState();
@@ -3719,10 +3720,10 @@ type FoodVisual = {
     if (e.button !== 2) return;
     if (performance.now() - lastPointerRightUpAt < RIGHT_CLICK_FALLBACK_MS) return;
 
-    if (skillHoldPointerId === MOUSE_FALLBACK_POINTER_ID) {
+    if (skillHoldPointerId !== undefined) {
       endSkillHold();
     }
-    if (skillAiming && skillAimPointerId === MOUSE_FALLBACK_POINTER_ID) {
+    if (skillAiming) {
       const target = skillAimTarget;
       cancelSkillAim();
       tryTapSkill(target);
@@ -3979,8 +3980,15 @@ type FoodVisual = {
     if (inMenu && lobbyPreviewRender) {
       const viewW = view.maxX - view.minX;
       const viewH = view.maxY - view.minY;
-      const cx = (view.minX + view.maxX) * 0.5 - viewW * 0.13;
-      const cy = (view.minY + view.maxY) * 0.5 + viewH * 0.11;
+      let cx = (view.minX + view.maxX) * 0.5 - viewW * 0.16;
+      let cy = (view.minY + view.maxY) * 0.5 + viewH * 0.11;
+
+      // Anchor the preview roughly at 2/5 of the screen width (and slightly below center) so it sits inside the left showcase.
+      const anchor = raycastWorld(screenW * 0.4, screenH * 0.56);
+      if (anchor) {
+        cx = anchor.x;
+        cy = anchor.y;
+      }
 
       const seed = lobbyPreviewRender.skinOffset;
       const turns = lobbyClass === 'iron' ? 1.15 : lobbyClass === 'shadow' ? 1.35 : 1.25;

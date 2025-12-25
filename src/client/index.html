@@ -78,10 +78,7 @@
       #menu.menu {
         position: absolute;
         inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 24px;
+        display: block;
         padding: 26px;
         pointer-events: none;
         transition: opacity 180ms ease, transform 220ms ease, filter 220ms ease;
@@ -96,8 +93,11 @@
       }
 
       .menu-left {
-        position: relative;
-        flex: 0 1 min(880px, calc(100vw - 540px));
+        position: absolute;
+        left: max(40vw, 420px);
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: min(820px, 44vw);
         min-width: 0;
         height: min(720px, calc(100vh - 52px));
         max-width: 920px;
@@ -146,10 +146,14 @@
 
       .menu-right {
         pointer-events: auto;
+        position: absolute;
+        left: min(80vw, calc(100vw - 240px));
+        top: 50%;
+        --dx: 0px;
+        transform: translate(calc(-50% + var(--dx)), -50%);
         width: min(460px, calc(100vw - 52px));
         max-height: calc(100vh - 52px);
         overflow: auto;
-        transform: translateX(0);
         transition: transform 260ms ease;
         will-change: transform;
       }
@@ -165,7 +169,7 @@
       }
 
       #menu.menu.hidden .menu-right {
-        transform: translateX(10px);
+        --dx: 10px;
       }
 
       #menu.menu .menu-right button {
@@ -217,7 +221,6 @@
 
       @media (max-width: 900px) {
         #menu.menu {
-          justify-content: center;
           padding: 18px;
         }
 
@@ -226,6 +229,11 @@
         }
 
         .menu-right {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          --dx: 0px;
+          transform: translate(-50%, -50%);
           width: min(420px, calc(100vw - 32px));
           max-height: calc(100vh - 32px);
         }
