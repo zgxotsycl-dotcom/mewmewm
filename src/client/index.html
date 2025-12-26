@@ -12,6 +12,7 @@
         font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple SD Gothic Neo",
           "Noto Sans KR", "Malgun Gothic", sans-serif;
         user-select: none;
+        overscroll-behavior: none;
       }
 
       canvas {
@@ -85,6 +86,11 @@
         --accent: rgba(120, 150, 255, 0.95);
         --accent-soft: rgba(120, 150, 255, 0.18);
         --accent-border: rgba(120, 150, 255, 0.28);
+        /* Swipe-driven carousel motion (JS updates these). */
+        --swipe-x: 0px;
+        --swipe-p: 0;
+        --swipe-abs: 0;
+        perspective: 1200px;
       }
 
       #menu.menu.hidden {
@@ -96,7 +102,9 @@
         position: absolute;
         left: 40vw;
         top: 50%;
-        transform: translate(-50%, -50%);
+        transform: translate(calc(-50% + var(--swipe-x) * 0.06), -50%)
+          rotateZ(calc(var(--swipe-p) * 0.7deg))
+          scale(calc(1 - var(--swipe-abs) * 0.018));
         width: min(820px, 44vw);
         min-width: 0;
         height: min(720px, calc(100vh - 52px));
@@ -104,6 +112,9 @@
         border-radius: 22px;
         overflow: hidden;
         pointer-events: auto;
+        transform-style: preserve-3d;
+        backface-visibility: hidden;
+        will-change: transform;
       }
 
       .menu-left::before {
@@ -150,12 +161,26 @@
         left: clamp(240px, 80vw, calc(100vw - 240px));
         top: 50%;
         --dx: 0px;
-        transform: translate(calc(-50% + var(--dx)), -50%);
+        transform: translate(calc(-50% + var(--dx) + var(--swipe-x) * 0.14), -50%)
+          rotateY(calc(var(--swipe-p) * -11deg))
+          rotateZ(calc(var(--swipe-p) * 1.1deg))
+          scale(calc(1 - var(--swipe-abs) * 0.02));
         width: min(460px, calc(100vw - 52px));
         max-height: calc(100vh - 52px);
         overflow: auto;
         transition: transform 260ms ease;
         will-change: transform;
+        transform-style: preserve-3d;
+        backface-visibility: hidden;
+        touch-action: pan-y;
+        overscroll-behavior: contain;
+      }
+
+      /* Prevent browser back/refresh gestures from fighting the lobby swipe carousel. */
+      #classSwipeArea,
+      .menu-left {
+        touch-action: none;
+        overscroll-behavior: none;
       }
 
       .menu-card {
@@ -170,6 +195,12 @@
 
       #menu.menu.hidden .menu-right {
         --dx: 10px;
+      }
+
+      /* While swiping we update transforms every frame; disable easing so it tracks input precisely. */
+      #menu.menu.swiping .menu-left,
+      #menu.menu.swiping .menu-right {
+        transition: none;
       }
 
       #menu.menu .menu-right button {

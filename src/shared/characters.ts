@@ -15,6 +15,7 @@ export const SKIN_ORDER: WormSkin[] = [
   'venom',
   'scarab',
   'frost',
+  'slug',
   'plasma',
   'chrono',
   'mirage',
@@ -22,6 +23,14 @@ export const SKIN_ORDER: WormSkin[] = [
 ];
 
 export const SKIN_DEFS: Record<WormSkin, SkinDef> = {
+  slug: {
+    title: 'Magnetic Slug',
+    role: 'magnetic',
+    theme: 'Arcana/Cosmic',
+    desc: 'Arcana singularity. A permanent gravity field pulls food, then collapses it into a mega orb.',
+    accent: 0xa55cff,
+    palette: [0x191970, 0x0b0d12, 0xa55cff, 0xff007f, 0xe0ffff, 0xffd34d],
+  },
   viper: {
     title: 'Viper',
     role: 'shadow',
@@ -99,13 +108,13 @@ export const SKIN_DEFS: Record<WormSkin, SkinDef> = {
 export const DEFAULT_SKIN_FOR_CLASS: Record<WormClass, WormSkin> = {
   iron: 'scarab',
   shadow: 'viper',
-  magnetic: 'plasma',
+  magnetic: 'slug',
 };
 
 export const SKINS_BY_CLASS: Record<WormClass, WormSkin[]> = {
   shadow: ['viper', 'eel', 'venom'],
   iron: ['scarab', 'frost'],
-  magnetic: ['plasma', 'chrono', 'mirage', 'void'],
+  magnetic: ['slug', 'plasma', 'chrono', 'mirage', 'void'],
 };
 
 export function classForSkin(skin: WormSkin): WormClass {
@@ -133,4 +142,9 @@ export function randomColorForSkin(skin: WormSkin): number {
   if (!def || def.palette.length === 0) return 0xffffff;
   const pick = def.palette[Math.floor(Math.random() * def.palette.length)];
   return pick ?? def.accent;
+}
+
+export function skinHasMagnetPassive(skin: WormSkin): boolean {
+  // Only a single character should have the "magnet" passive (auto-pull nearby food).
+  return skin === 'slug';
 }

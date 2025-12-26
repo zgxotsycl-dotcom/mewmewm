@@ -11,6 +11,7 @@ export interface WorldConfig {
 export type WormClass = 'iron' | 'shadow' | 'magnetic';
 
 export type WormSkin =
+  | 'slug'
   | 'viper'
   | 'eel'
   | 'venom'
@@ -83,6 +84,7 @@ export interface FoodState {
   r: number;
   color: number;
   value: number;
+  kind?: 'singularity';
 }
 
 export interface GasState {
@@ -107,6 +109,7 @@ export interface BlackHoleState {
   x: number;
   y: number;
   r: number;
+  createdAt: number;
   expiresAt: number;
 }
 

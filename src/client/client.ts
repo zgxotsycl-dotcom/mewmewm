@@ -3,7 +3,7 @@ import type { Graphics } from 'pixi.js';
 import { io, type Socket } from 'socket.io-client';
 
 import { CLASS_BASE_SKILL, EVO_THRESHOLDS, MIN_SEGMENTS, skillCooldownMs } from '../shared/balance';
-import { SKIN_DEFS, SKIN_ORDER, classForSkin, defaultSkinForClass, sanitizeSkin } from '../shared/characters';
+import { SKIN_DEFS, SKIN_ORDER, classForSkin, defaultSkinForClass, sanitizeSkin, skinHasMagnetPassive } from '../shared/characters';
 
 import type {
   ClientToServerEvents,
@@ -62,6 +62,10 @@ type PlayerRender = {
   bank: number;
   scarf?: THREE.Mesh;
   magicCircle?: THREE.Mesh;
+  chronoRewindDisc?: THREE.Mesh;
+  plasmaBeamGlow?: THREE.Mesh;
+  plasmaBeamCore?: THREE.Mesh;
+  plasmaCharge?: THREE.Mesh;
   visualLen: number;
   tailTip?: Vec2f;
   skinSeed: number;
@@ -73,6 +77,9 @@ type PlayerRender = {
   styleColor: number;
   prevArmor: number;
   prevStealth: boolean;
+  prevSkill: MutationId;
+  prevSkillActive: boolean;
+  skillFxAcc: number;
 };
 
 type Particle = {
@@ -97,6 +104,8 @@ const BODY_RADIUS = 14;
 const SEGMENT_SPACING = 12;
 const SINGULARITY_RADIUS = 240;
 const SINGULARITY_MAX_RANGE = 1400;
+const PLASMA_RAY_RANGE = 1700;
+const PLASMA_RAY_HALF_WIDTH = 120;
 
 // Camera zoom rules:
 // - Higher zoom = closer (less FOV), lower zoom = farther (more FOV)
@@ -1203,6 +1212,32 @@ function constrainChain(segs: Vec2f[], spacing: number): void {
   }
 }
 
+function stitchChainToTargetDirections(
+  segs: Vec2f[],
+  target: Vec2f[],
+  spacing: number,
+  maxLinksFromHead: number,
+): void {
+  const n = Math.min(segs.length, target.length);
+  if (n <= 1) return;
+
+  const limit = Math.min(n - 1, Math.max(1, maxLinksFromHead));
+  for (let i = 1; i <= limit; i++) {
+    const prev = segs[i - 1]!;
+    const tPrev = target[i - 1]!;
+    const tCur = target[i]!;
+    const dx = tCur.x - tPrev.x;
+    const dy = tCur.y - tPrev.y;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d <= 0.0001) continue;
+
+    const inv = 1 / d;
+    const cur = segs[i]!;
+    cur.x = prev.x + dx * inv * spacing;
+    cur.y = prev.y + dy * inv * spacing;
+  }
+}
+
 function isInsideView(x: number, y: number, view: { minX: number; maxX: number; minY: number; maxY: number }, margin: number): boolean {
   return x >= view.minX - margin && x <= view.maxX + margin && y >= view.minY - margin && y <= view.maxY + margin;
 }
@@ -1650,6 +1685,38 @@ async function main() {
 
   updateLobby(lobbySkin, false);
 
+  // Lobby swipe animation state (UI + 3D preview).
+  const LOBBY_SWIPE_MAX_PX = 360;
+  const LOBBY_SWIPE_COMMIT_PX = 110;
+  const LOBBY_SWIPE_COMMIT_VEL_PX_PER_MS = 0.85;
+  let lobbySwipeX = 0;
+  let lobbySwipeXTarget = 0;
+  let lobbySwipeDragging = false;
+  let lobbySwipeCssX = Number.NaN;
+  let lobbySwipeCssP = Number.NaN;
+  let lobbySwipeCssA = Number.NaN;
+
+  const lobbySwipeMaxDragPx = (): number => clamp(window.innerWidth * 0.38, 260, 420);
+
+  const setLobbySwipeCss = (x: number): void => {
+    const px = clamp(x, -LOBBY_SWIPE_MAX_PX, LOBBY_SWIPE_MAX_PX);
+    const p = clamp(px / LOBBY_SWIPE_MAX_PX, -1, 1);
+    const a = Math.abs(p);
+
+    if (!Number.isFinite(lobbySwipeCssX) || Math.abs(px - lobbySwipeCssX) > 0.25) {
+      menu.style.setProperty('--swipe-x', `${px.toFixed(1)}px`);
+      lobbySwipeCssX = px;
+    }
+    if (!Number.isFinite(lobbySwipeCssP) || Math.abs(p - lobbySwipeCssP) > 0.002) {
+      menu.style.setProperty('--swipe-p', `${p.toFixed(3)}`);
+      lobbySwipeCssP = p;
+    }
+    if (!Number.isFinite(lobbySwipeCssA) || Math.abs(a - lobbySwipeCssA) > 0.002) {
+      menu.style.setProperty('--swipe-abs', `${a.toFixed(3)}`);
+      lobbySwipeCssA = a;
+    }
+  };
+
   let lobbySwapTimer: number | undefined;
   const triggerLobbySwap = (dir: -1 | 1): void => {
     classPanel.dataset.dir = dir === 1 ? 'next' : 'prev';
@@ -1677,6 +1744,9 @@ async function main() {
   const bindLobbySwipe = (el: HTMLElement): void => {
     let swipePointerId: number | undefined;
     let swipeStartX: number | undefined;
+    let swipeStartY: number | undefined;
+    let swipeStartT: number | undefined;
+    let swipeMoved = false;
 
     el.addEventListener('pointerdown', (e) => {
       if (menu.classList.contains('hidden')) return;
@@ -1685,12 +1755,47 @@ async function main() {
 
       swipePointerId = e.pointerId;
       swipeStartX = e.clientX;
+      swipeStartY = e.clientY;
+      swipeStartT = performance.now();
+      swipeMoved = false;
+      lobbySwipeDragging = true;
       try {
         el.setPointerCapture(e.pointerId);
       } catch {
         // ignore
       }
     });
+
+    el.addEventListener(
+      'pointermove',
+      (e) => {
+      if (swipePointerId !== e.pointerId) return;
+      if (swipeStartX === undefined || swipeStartY === undefined) return;
+      if (menu.classList.contains('hidden')) return;
+
+      const dx = e.clientX - swipeStartX;
+      const dy = e.clientY - swipeStartY;
+
+      if (!swipeMoved) {
+        if (Math.abs(dx) < 6) return;
+        // Ignore mostly-vertical gestures (lets users scroll the right panel if needed).
+        if (Math.abs(dy) > Math.abs(dx) * 1.15) return;
+        swipeMoved = true;
+      }
+
+      // Once the gesture is recognized as a horizontal swipe, prevent browser navigation/refresh gestures.
+      if (swipeMoved && e.cancelable) e.preventDefault();
+
+      const clampedDx = clamp(dx, -lobbySwipeMaxDragPx(), lobbySwipeMaxDragPx());
+      lobbySwipeX = clampedDx;
+      lobbySwipeXTarget = clampedDx;
+
+      classPanel.dataset.dir = clampedDx < 0 ? 'next' : 'prev';
+      if (!menu.classList.contains('swiping')) menu.classList.add('swiping');
+      setLobbySwipeCss(lobbySwipeX);
+      },
+      { passive: false },
+    );
 
     el.addEventListener('pointerup', (e) => {
       if (swipePointerId !== e.pointerId) return;
@@ -1699,13 +1804,24 @@ async function main() {
 
       swipePointerId = undefined;
       swipeStartX = undefined;
+      swipeStartY = undefined;
+      const dtMs = Math.max(1, (performance.now() - (swipeStartT ?? performance.now())));
+      swipeStartT = undefined;
       try {
         el.releasePointerCapture(e.pointerId);
       } catch {
         // ignore
       }
 
-      if (Math.abs(dx) < 24) return;
+      lobbySwipeDragging = false;
+      lobbySwipeXTarget = 0;
+
+      if (!swipeMoved) return;
+      swipeMoved = false;
+
+      const vel = dx / dtMs; // px/ms
+      const commit = Math.abs(dx) >= LOBBY_SWIPE_COMMIT_PX || Math.abs(vel) >= LOBBY_SWIPE_COMMIT_VEL_PX_PER_MS;
+      if (!commit) return;
       stepLobby(dx > 0 ? -1 : 1);
     });
 
@@ -1713,6 +1829,11 @@ async function main() {
       if (swipePointerId !== e.pointerId) return;
       swipePointerId = undefined;
       swipeStartX = undefined;
+      swipeStartY = undefined;
+      swipeStartT = undefined;
+      swipeMoved = false;
+      lobbySwipeDragging = false;
+      lobbySwipeXTarget = 0;
       try {
         el.releasePointerCapture(e.pointerId);
       } catch {
@@ -1819,13 +1940,42 @@ async function main() {
   const GAS_MAX_INST = 800;
   const gasMesh = new THREE.InstancedMesh(
     new THREE.SphereGeometry(1, 16, 12),
-    new THREE.MeshBasicMaterial({ color: 0x0b0d12, transparent: true, opacity: 0.15, depthWrite: false }),
+    new THREE.MeshBasicMaterial({
+      color: 0x0a2b1c,
+      transparent: true,
+      opacity: 0.18,
+      depthTest: false,
+      depthWrite: false,
+    }),
     GAS_MAX_INST,
   );
   gasMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   gasMesh.frustumCulled = false;
   gasMesh.count = 0;
   world.add(gasMesh);
+
+  const gasGlowMesh = new THREE.InstancedMesh(
+    foodGlowGeometry,
+    new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0xffffff,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.55,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    }),
+    GAS_MAX_INST,
+  );
+  gasGlowMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(GAS_MAX_INST * 3), 3);
+  gasGlowMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  gasGlowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  gasGlowMesh.frustumCulled = false;
+  gasGlowMesh.count = 0;
+  gasGlowMesh.renderOrder = 1;
+  world.add(gasGlowMesh);
 
   const iceZoneGroup = new THREE.Group();
   world.add(iceZoneGroup);
@@ -1838,25 +1988,244 @@ async function main() {
   const blackHoleGroup = new THREE.Group();
   world.add(blackHoleGroup);
 
+  const singularityFoodGroup = new THREE.Group();
+  world.add(singularityFoodGroup);
+
   const blackHoleCoreGeometry = new THREE.CircleGeometry(0.58, 64);
   blackHoleCoreGeometry.rotateX(-Math.PI / 2);
   const blackHoleRingGeometry = new THREE.RingGeometry(0.58, 1.0, 96);
   blackHoleRingGeometry.rotateX(-Math.PI / 2);
 
-  type BlackHoleRender = { group: THREE.Group; core: THREE.Mesh; ring: THREE.Mesh };
+  const blackHoleLensGeometry = new THREE.RingGeometry(1.0, 1.32, 144);
+  blackHoleLensGeometry.rotateX(-Math.PI / 2);
+
+  const plasmaBeamGeometry = new THREE.PlaneGeometry(1, 1, 1, 1);
+  plasmaBeamGeometry.rotateX(-Math.PI / 2);
+  // Offset so the beam starts at local z=0 (easier to anchor at the head).
+  plasmaBeamGeometry.translate(0, 0, 0.5);
+
+  const vortexVertexShader = `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+
+  const vortexCoreFragmentShader = `
+    varying vec2 vUv;
+    uniform float uTime;
+    uniform float uAlpha;
+    uniform float uSeed;
+    uniform vec3 uEdgeColor;
+
+    void main() {
+      vec2 p = vUv - vec2(0.5);
+      float r = length(p) * 2.0;
+      if (r > 1.02) discard;
+
+      float a = atan(p.y, p.x);
+      float s1 = sin(a * 6.0 + r * 14.0 - uTime * 2.6 + uSeed);
+      float s2 = sin(a * 13.0 - r * 22.0 + uTime * 1.9 + uSeed * 1.7);
+      float n = 0.5 + 0.5 * sin(s1 * 1.4 + s2 * 0.9);
+
+      float rim = smoothstep(1.02, 0.72, r);
+      float edge = smoothstep(0.45, 1.0, r);
+      float centerCut = smoothstep(0.0, 0.22, r);
+
+      vec3 base = vec3(0.01, 0.01, 0.015);
+      vec3 col = mix(base, uEdgeColor, edge * (0.65 + 0.25 * n));
+      float alpha = uAlpha * (0.92 * rim + 0.06 * edge) * (1.0 - centerCut * 0.55);
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  const vortexDiskFragmentShader = `
+    varying vec2 vUv;
+    uniform float uTime;
+    uniform float uAlpha;
+    uniform float uSeed;
+    uniform vec3 uColorA;
+    uniform vec3 uColorB;
+
+    void main() {
+      vec2 p = vUv - vec2(0.5);
+      float r = length(p) * 2.0;
+      if (r > 1.25) discard;
+
+      float a = atan(p.y, p.x);
+      float band1 = sin(a * 10.0 + r * 18.0 + uTime * 3.2 + uSeed);
+      float band2 = sin(a * 4.0 - r * 10.0 - uTime * 2.1 + uSeed * 0.6);
+      float n = 0.5 + 0.5 * sin(band1 * 1.6 + band2 * 1.25);
+
+      // Brightness peaks near the mid ring and outer edge.
+      float mid = smoothstep(0.2, 0.65, r) * (1.0 - smoothstep(0.92, 1.05, r));
+      float edge = smoothstep(0.72, 1.04, r) * (1.0 - smoothstep(1.04, 1.18, r));
+      float mask = clamp(mid + edge * 0.55, 0.0, 1.0);
+
+      vec3 col = mix(uColorA, uColorB, n);
+      float alpha = uAlpha * mask * (0.26 + 0.74 * n);
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  const plasmaBeamFragmentShader = `
+    varying vec2 vUv;
+    uniform float uTime;
+    uniform float uAlpha;
+    uniform float uSeed;
+    uniform float uStrength;
+    uniform vec3 uColorA;
+    uniform vec3 uColorB;
+
+    void main() {
+      vec2 uv = vUv;
+
+      float x = abs(uv.x - 0.5) * 2.0;
+      float core = 1.0 - smoothstep(0.0, 0.22, x);
+      float glow = 1.0 - smoothstep(0.0, 1.0, x);
+
+      // Fade in quickly at the head and fade out near the tip.
+      float along = smoothstep(0.0, 0.035, uv.y) * (1.0 - smoothstep(0.9, 1.0, uv.y));
+
+      float shimmer = 0.6 + 0.4 * sin(uTime * 18.0 + uv.y * 24.0 + uSeed * 2.0);
+      float bands = 0.5 + 0.5 * sin(uv.y * 16.0 - uTime * 6.0 + sin(uv.y * 5.0 + uTime * 2.0 + uSeed));
+
+      float energy = (0.12 + 0.88 * glow) * along;
+      vec3 col = mix(uColorA, uColorB, bands);
+      col = mix(col, vec3(1.0), core * 0.7);
+
+      float alpha = uAlpha * uStrength * energy * (0.55 + 0.45 * shimmer);
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  const createBlackHoleCoreMaterial = (seed: number): THREE.ShaderMaterial => {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uAlpha: { value: 1 },
+        uSeed: { value: seed },
+        uEdgeColor: { value: new THREE.Color(0x2b0a4a) },
+      },
+      vertexShader: vortexVertexShader,
+      fragmentShader: vortexCoreFragmentShader,
+    });
+    return mat;
+  };
+
+  const createBlackHoleDiskMaterial = (seed: number): THREE.ShaderMaterial => {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uAlpha: { value: 1 },
+        uSeed: { value: seed },
+        uColorA: { value: new THREE.Color(0xb000ff) },
+        uColorB: { value: new THREE.Color(0x00e5ff) },
+      },
+      vertexShader: vortexVertexShader,
+      fragmentShader: vortexDiskFragmentShader,
+    });
+    return mat;
+  };
+
+  const createPlasmaBeamMaterial = (seed: number, strength: number): THREE.ShaderMaterial => {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uAlpha: { value: 0 },
+        uSeed: { value: seed },
+        uStrength: { value: strength },
+        uColorA: { value: new THREE.Color(0x00e5ff) },
+        uColorB: { value: new THREE.Color(0xff2df7) },
+      },
+      vertexShader: vortexVertexShader,
+      fragmentShader: plasmaBeamFragmentShader,
+    });
+    return mat;
+  };
+
+  const createSingularityFoodCoreMaterial = (seed: number): THREE.ShaderMaterial => {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uAlpha: { value: 1 },
+        uSeed: { value: seed },
+        uEdgeColor: { value: new THREE.Color(0x3b105f) },
+      },
+      vertexShader: vortexVertexShader,
+      fragmentShader: vortexCoreFragmentShader,
+    });
+    return mat;
+  };
+
+  const createSingularityFoodDiskMaterial = (seed: number): THREE.ShaderMaterial => {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uAlpha: { value: 1 },
+        uSeed: { value: seed },
+        uColorA: { value: new THREE.Color(0x140a22) },
+        uColorB: { value: new THREE.Color(0x7b2cff) },
+      },
+      vertexShader: vortexVertexShader,
+      fragmentShader: vortexDiskFragmentShader,
+    });
+    return mat;
+  };
+
+  type BlackHoleRender = {
+    group: THREE.Group;
+    core: THREE.Mesh;
+    disk: THREE.Mesh;
+    lens: THREE.Mesh;
+    seed: number;
+    outroFxDone: boolean;
+  };
   const blackHoleRenders = new Map<string, BlackHoleRender>();
 
-  type IceZoneRender = { group: THREE.Group; fill: THREE.Mesh; ring: THREE.Mesh };
+  type SingularityFoodRender = {
+    group: THREE.Group;
+    core: THREE.Mesh;
+    disk: THREE.Mesh;
+    lens: THREE.Mesh;
+    seed: number;
+  };
+  const singularityFoodRenders = new Map<string, SingularityFoodRender>();
+
+  type IceZoneRender = { group: THREE.Group; fill: THREE.Mesh; pattern: THREE.Mesh; ring: THREE.Mesh };
   const iceZoneRenders = new Map<string, IceZoneRender>();
 
   const aimIndicatorGeometry = new THREE.RingGeometry(0.82, 1.0, 84);
   aimIndicatorGeometry.rotateX(-Math.PI / 2);
-  const aimIndicatorMaterial = new THREE.MeshBasicMaterial({
-    color: 0x9dff00,
-    transparent: true,
-    opacity: 0.55,
-    depthWrite: false,
-  });
+	  const aimIndicatorMaterial = new THREE.MeshBasicMaterial({
+	    color: 0x9dff00,
+	    transparent: true,
+	    opacity: 0.55,
+	    depthTest: false,
+	    depthWrite: false,
+	  });
   const aimIndicator = new THREE.Mesh(aimIndicatorGeometry, aimIndicatorMaterial);
   aimIndicator.visible = false;
   blackHoleGroup.add(aimIndicator);
@@ -1926,6 +2295,7 @@ type FoodVisual = {
   tr: number;
   color: number;
   value: number;
+  kind?: 'singularity';
   present: boolean;
   alpha: number;
   sucked: boolean;
@@ -1988,15 +2358,16 @@ type FoodVisual = {
       geo.userData.len = SCARF_LENGTH;
     }
 
-    const mat = new THREE.MeshBasicMaterial({
-      color: 0x00e5ff,
-      transparent: true,
-      opacity: 0,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
+	    const mat = new THREE.MeshBasicMaterial({
+	      color: 0x00e5ff,
+	      transparent: true,
+	      opacity: 0,
+	      side: THREE.DoubleSide,
+	      depthTest: false,
+	      depthWrite: false,
+	      blending: THREE.AdditiveBlending,
+	      toneMapped: false,
+	    });
 
     const mesh = new THREE.Mesh(geo, mat);
     mesh.renderOrder = 2;
@@ -2005,16 +2376,17 @@ type FoodVisual = {
   };
 
   const createMagicCircleMesh = (): THREE.Mesh => {
-    const mat = new THREE.MeshBasicMaterial({
-      map: runeTexture,
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      toneMapped: false,
-    });
+	    const mat = new THREE.MeshBasicMaterial({
+	      map: runeTexture,
+	      color: 0xffffff,
+	      transparent: true,
+	      opacity: 0,
+	      side: THREE.DoubleSide,
+	      depthTest: false,
+	      depthWrite: false,
+	      blending: THREE.AdditiveBlending,
+	      toneMapped: false,
+	    });
     const mesh = new THREE.Mesh(magicCircleGeometry, mat);
     mesh.renderOrder = 1;
     mesh.visible = false;
@@ -2198,12 +2570,55 @@ type FoodVisual = {
       opacity: 0,
       side: THREE.DoubleSide,
       depthWrite: false,
-      blending: THREE.NormalBlending,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
     });
     const aura = new THREE.Mesh(auraGeometry, auraMat);
     aura.rotation.x = -Math.PI / 2;
     aura.position.y = 0.03;
     aura.renderOrder = 1;
+
+    const chronoRewindMat = new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0xffb15a,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const chronoRewindDisc = new THREE.Mesh(foodGlowGeometry, chronoRewindMat);
+    chronoRewindDisc.position.y = 0.025;
+    chronoRewindDisc.renderOrder = 1;
+    chronoRewindDisc.visible = false;
+
+    const fxSeed = (hashString32(id) >>> 0) * (1 / 0xffffffff) * 10.0;
+    const plasmaBeamGlow = new THREE.Mesh(plasmaBeamGeometry, createPlasmaBeamMaterial(fxSeed, 0.55));
+    plasmaBeamGlow.position.y = 0.09;
+    plasmaBeamGlow.renderOrder = 8;
+    plasmaBeamGlow.visible = false;
+
+    const plasmaBeamCore = new THREE.Mesh(plasmaBeamGeometry, createPlasmaBeamMaterial(fxSeed + 1.37, 1.0));
+    plasmaBeamCore.position.y = 0.095;
+    plasmaBeamCore.renderOrder = 9;
+    plasmaBeamCore.visible = false;
+
+    const plasmaChargeMat = new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0x00e5ff,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const plasmaCharge = new THREE.Mesh(foodGlowGeometry, plasmaChargeMat);
+    plasmaCharge.position.y = 0.09;
+    plasmaCharge.renderOrder = 10;
+    plasmaCharge.visible = false;
 
     const nameSprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false }),
@@ -2214,6 +2629,10 @@ type FoodVisual = {
 
     group.add(shadow);
     group.add(aura);
+    group.add(chronoRewindDisc);
+    group.add(plasmaBeamGlow);
+    group.add(plasmaBeamCore);
+    group.add(plasmaCharge);
     group.add(magicCircle);
     group.add(scarf);
     group.add(spine);
@@ -2255,6 +2674,10 @@ type FoodVisual = {
       bank: 0,
       scarf,
       magicCircle,
+      chronoRewindDisc,
+      plasmaBeamGlow,
+      plasmaBeamCore,
+      plasmaCharge,
       visualLen: 0,
       skinSeed: seed,
       skinPalette: [],
@@ -2265,6 +2688,9 @@ type FoodVisual = {
       styleColor: 0,
       prevArmor: 0,
       prevStealth: false,
+      prevSkill: CLASS_BASE_SKILL.shadow,
+      prevSkillActive: false,
+      skillFxAcc: 0,
     };
     playerRenders.set(id, render);
     return render;
@@ -2342,12 +2768,55 @@ type FoodVisual = {
       opacity: 0,
       side: THREE.DoubleSide,
       depthWrite: false,
-      blending: THREE.NormalBlending,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
     });
     const aura = new THREE.Mesh(auraGeometry, auraMat);
     aura.rotation.x = -Math.PI / 2;
     aura.position.y = 0.03;
     aura.renderOrder = 1;
+
+    const chronoRewindMat = new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0xffb15a,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const chronoRewindDisc = new THREE.Mesh(foodGlowGeometry, chronoRewindMat);
+    chronoRewindDisc.position.y = 0.025;
+    chronoRewindDisc.renderOrder = 1;
+    chronoRewindDisc.visible = false;
+
+    const fxSeed = (hashString32(id) >>> 0) * (1 / 0xffffffff) * 10.0;
+    const plasmaBeamGlow = new THREE.Mesh(plasmaBeamGeometry, createPlasmaBeamMaterial(fxSeed, 0.55));
+    plasmaBeamGlow.position.y = 0.09;
+    plasmaBeamGlow.renderOrder = 8;
+    plasmaBeamGlow.visible = false;
+
+    const plasmaBeamCore = new THREE.Mesh(plasmaBeamGeometry, createPlasmaBeamMaterial(fxSeed + 1.37, 1.0));
+    plasmaBeamCore.position.y = 0.095;
+    plasmaBeamCore.renderOrder = 9;
+    plasmaBeamCore.visible = false;
+
+    const plasmaChargeMat = new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
+      color: 0x00e5ff,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const plasmaCharge = new THREE.Mesh(foodGlowGeometry, plasmaChargeMat);
+    plasmaCharge.position.y = 0.09;
+    plasmaCharge.renderOrder = 10;
+    plasmaCharge.visible = false;
 
     const nameSprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false }),
@@ -2358,6 +2827,10 @@ type FoodVisual = {
 
     group.add(shadow);
     group.add(aura);
+    group.add(chronoRewindDisc);
+    group.add(plasmaBeamGlow);
+    group.add(plasmaBeamCore);
+    group.add(plasmaCharge);
     group.add(magicCircle);
     group.add(scarf);
     group.add(spine);
@@ -2400,6 +2873,10 @@ type FoodVisual = {
       bank: 0,
       scarf,
       magicCircle,
+      chronoRewindDisc,
+      plasmaBeamGlow,
+      plasmaBeamCore,
+      plasmaCharge,
       visualLen: 0,
       skinSeed: seed,
       skinPalette: [],
@@ -2410,6 +2887,9 @@ type FoodVisual = {
       styleColor: 0,
       prevArmor: 0,
       prevStealth: false,
+      prevSkill: CLASS_BASE_SKILL.shadow,
+      prevSkillActive: false,
+      skillFxAcc: 0,
     };
     decoyRenders.set(id, render);
     return render;
@@ -2518,6 +2998,9 @@ type FoodVisual = {
       case 'frost':
         stripe = 5;
         break;
+      case 'slug':
+        stripe = 10;
+        break;
       case 'plasma':
         stripe = 8;
         break;
@@ -2551,18 +3034,13 @@ type FoodVisual = {
 
     // Body geometry per role (skin can override silhouette via scale).
     render.body.geometry = render.dna === 'iron' ? wormBodyHexGeometry : wormBodyRoundGeometry;
+    // IMPORTANT: Do not scale the InstancedMesh itself.
+    // InstancedMesh scale would also scale instance translations (about the world origin),
+    // making the head/body appear detached in gameplay when far from (0,0).
     render.body.scale.set(1, 1, 1);
 
     // Flat shading helps armored/tank bodies read as plated.
     render.material.flatShading = render.dna === 'iron';
-    if (render.skin === 'scarab') render.body.scale.set(1.16, 0.98, 1.12);
-    if (render.skin === 'frost') render.body.scale.set(1.1, 1.0, 1.08);
-    if (render.skin === 'eel') render.body.scale.set(0.94, 1.02, 0.9);
-    if (render.skin === 'venom') render.body.scale.set(0.98, 1.02, 0.94);
-    if (render.skin === 'plasma') render.body.scale.set(1.02, 1.0, 0.98);
-    if (render.skin === 'chrono') render.body.scale.set(1.05, 1.0, 1.02);
-    if (render.skin === 'mirage') render.body.scale.set(1.0, 0.98, 1.0);
-    if (render.skin === 'void') render.body.scale.set(1.08, 1.02, 1.08);
     render.material.needsUpdate = true;
 
     render.spine.visible = false;
@@ -2739,6 +3217,42 @@ type FoodVisual = {
         render.head.add(shard, sideL, sideR);
         break;
       }
+      case 'slug': {
+        const shell = makeHeadMat(base, { roughness: 0.22, metalness: 0.05 });
+        const rimMat = makeHeadMat(accent, {
+          roughness: 0.12,
+          metalness: 0.0,
+          emissive: accent,
+          emissiveIntensity: 0.7,
+        });
+        const voidMat = makeHeadMat(0x05060a, { roughness: 0.95, metalness: 0.0 });
+        const rune = makeHeadMat(neonA, {
+          roughness: 0.12,
+          metalness: 0.0,
+          emissive: neonA,
+          emissiveIntensity: 0.55,
+          opacity: 0.94,
+        });
+        render.headMaterials.push(shell, rimMat, voidMat, rune);
+
+        const body = new THREE.Mesh(magneticHeadGeometry, shell);
+        body.scale.set(1.18, 0.92, 1.22);
+        body.position.set(0, 0.02, 0.08);
+
+        const mouthRim = new THREE.Mesh(magneticMouthGeometry, rimMat);
+        const mouthDisc = new THREE.Mesh(magneticMouthDiscGeometry, voidMat);
+
+        const halo = new THREE.Mesh(arcanaRingGeometry, rune);
+        halo.position.set(0, 0.18, 0.08);
+        halo.scale.set(0.92, 0.92, 0.92);
+
+        body.renderOrder = 4;
+        mouthRim.renderOrder = 4;
+        mouthDisc.renderOrder = 4;
+        halo.renderOrder = 4;
+        render.head.add(body, mouthRim, mouthDisc, halo);
+        break;
+      }
       case 'plasma': {
         const matte = makeHeadMat(base, { roughness: 0.68, metalness: 0.1 });
         const neon = makeHeadMat(accent, {
@@ -2872,12 +3386,18 @@ type FoodVisual = {
     }
 
     // Neck/core filler: many head meshes are forward-shifted (cones/blades), which can leave a visible gap.
-    // This small core sits slightly back towards the neck so the head always reads as attached.
-    const coreMat = render.headMaterials[0];
-    if (coreMat) {
+    // Use a solid clone of the primary head material so even translucent heads (e.g., Frost) still read as connected.
+    const coreBase = render.headMaterials[0];
+    if (coreBase) {
+      const coreMat = coreBase.clone();
+      coreMat.transparent = true;
+      coreMat.opacity = 1;
+      coreMat.needsUpdate = true;
+      render.headMaterials.push(coreMat);
+
       const core = new THREE.Mesh(headCoreGeometry, coreMat);
-      core.position.set(0, -0.02, -0.22);
-      core.scale.set(1.08, 0.94, 1.02);
+      core.position.set(0, -0.04, -0.18);
+      core.scale.set(1.26, 1.04, 1.3);
       core.renderOrder = 4;
       render.head.add(core);
     }
@@ -2917,32 +3437,37 @@ type FoodVisual = {
     const group = new THREE.Group();
     blackHoleGroup.add(group);
 
-    const coreMat = new THREE.MeshBasicMaterial({
-      color: 0x06070a,
-      transparent: true,
-      opacity: 0.95,
-      depthWrite: false,
-    });
+    const seed = (hashString32(id) >>> 0) * (1 / 0xffffffff) * 10.0;
+
+    const coreMat = createBlackHoleCoreMaterial(seed);
     const core = new THREE.Mesh(blackHoleCoreGeometry, coreMat);
     core.position.y = 0.025;
     core.renderOrder = 2;
 
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xb000ff,
+    const diskMat = createBlackHoleDiskMaterial(seed);
+    const disk = new THREE.Mesh(blackHoleRingGeometry, diskMat);
+    disk.position.y = 0.03;
+    disk.renderOrder = 3;
+
+    const lensMat = new THREE.MeshBasicMaterial({
+      color: 0xa55cff,
       transparent: true,
-      opacity: 0.72,
+      opacity: 0.0,
       side: THREE.DoubleSide,
+      depthTest: false,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
+      toneMapped: false,
     });
-    const ring = new THREE.Mesh(blackHoleRingGeometry, ringMat);
-    ring.position.y = 0.03;
-    ring.renderOrder = 3;
+    const lens = new THREE.Mesh(blackHoleLensGeometry, lensMat);
+    lens.position.y = 0.031;
+    lens.renderOrder = 4;
 
     group.add(core);
-    group.add(ring);
+    group.add(disk);
+    group.add(lens);
 
-    const render: BlackHoleRender = { group, core, ring };
+    const render: BlackHoleRender = { group, core, disk, lens, seed, outroFxDone: false };
     blackHoleRenders.set(id, render);
     return render;
   }
@@ -2950,7 +3475,64 @@ type FoodVisual = {
   function disposeBlackHoleRender(render: BlackHoleRender): void {
     blackHoleGroup.remove(render.group);
     (render.core.material as THREE.Material).dispose();
-    (render.ring.material as THREE.Material).dispose();
+    (render.disk.material as THREE.Material).dispose();
+    (render.lens.material as THREE.Material).dispose();
+  }
+
+  function ensureSingularityFoodRender(id: string): SingularityFoodRender {
+    const existing = singularityFoodRenders.get(id);
+    if (existing) return existing;
+
+    const group = new THREE.Group();
+    singularityFoodGroup.add(group);
+
+    const seed = (hashString32(id) >>> 0) * (1 / 0xffffffff) * 10.0;
+
+    const coreMat = createSingularityFoodCoreMaterial(seed);
+    const core = new THREE.Mesh(blackHoleCoreGeometry, coreMat);
+    core.position.y = 0.02;
+    core.renderOrder = 3;
+
+    const diskMat = createSingularityFoodDiskMaterial(seed);
+    const disk = new THREE.Mesh(blackHoleRingGeometry, diskMat);
+    disk.position.y = 0.025;
+    disk.renderOrder = 4;
+
+    const lensMat = new THREE.MeshBasicMaterial({
+      color: 0xa55cff,
+      transparent: true,
+      opacity: 0.0,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const lens = new THREE.Mesh(blackHoleLensGeometry, lensMat);
+    lens.position.y = 0.026;
+    lens.renderOrder = 5;
+
+    group.add(core);
+    group.add(disk);
+    group.add(lens);
+
+    const render: SingularityFoodRender = { group, core, disk, lens, seed };
+    singularityFoodRenders.set(id, render);
+    return render;
+  }
+
+  function disposeSingularityFoodRender(render: SingularityFoodRender): void {
+    singularityFoodGroup.remove(render.group);
+    (render.core.material as THREE.Material).dispose();
+    (render.disk.material as THREE.Material).dispose();
+    (render.lens.material as THREE.Material).dispose();
+  }
+
+  function destroySingularityFoodRender(id: string): void {
+    const render = singularityFoodRenders.get(id);
+    if (!render) return;
+    disposeSingularityFoodRender(render);
+    singularityFoodRenders.delete(id);
   }
 
   function destroyMissingBlackHoles(live: BlackHoleState[]): void {
@@ -2970,32 +3552,52 @@ type FoodVisual = {
     iceZoneGroup.add(group);
 
     const fillMat = new THREE.MeshBasicMaterial({
+      map: foodGlowTexture,
       color: 0x7be7ff,
       transparent: true,
-      opacity: 0.12,
+      opacity: 0.14,
+      depthTest: false,
       depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
     });
     const fill = new THREE.Mesh(iceZoneFillGeometry, fillMat);
     fill.position.y = 0.021;
     fill.renderOrder = 1;
 
+    const patternMat = new THREE.MeshBasicMaterial({
+      map: runeTexture,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.0,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const pattern = new THREE.Mesh(iceZoneFillGeometry, patternMat);
+    pattern.position.y = 0.0215;
+    pattern.renderOrder = 2;
+
     const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xb7f6ff,
+      color: 0xffffff,
       transparent: true,
       opacity: 0.34,
       side: THREE.DoubleSide,
+      depthTest: false,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       toneMapped: false,
     });
     const ring = new THREE.Mesh(iceZoneRingGeometry, ringMat);
     ring.position.y = 0.022;
-    ring.renderOrder = 2;
+    ring.renderOrder = 3;
 
     group.add(fill);
+    group.add(pattern);
     group.add(ring);
 
-    const render: IceZoneRender = { group, fill, ring };
+    const render: IceZoneRender = { group, fill, pattern, ring };
     iceZoneRenders.set(id, render);
     return render;
   }
@@ -3003,6 +3605,7 @@ type FoodVisual = {
   function disposeIceZoneRender(render: IceZoneRender): void {
     iceZoneGroup.remove(render.group);
     (render.fill.material as THREE.Material).dispose();
+    (render.pattern.material as THREE.Material).dispose();
     (render.ring.material as THREE.Material).dispose();
   }
 
@@ -3023,6 +3626,25 @@ type FoodVisual = {
     render.headMaterials.length = 0;
     (render.shadow.material as THREE.Material).dispose();
     (render.aura.material as THREE.Material).dispose();
+    if (render.chronoRewindDisc) {
+      (render.chronoRewindDisc.material as THREE.Material).dispose();
+      render.chronoRewindDisc = undefined;
+    }
+    if (render.plasmaBeamGlow) {
+      render.group.remove(render.plasmaBeamGlow);
+      (render.plasmaBeamGlow.material as THREE.Material).dispose();
+      render.plasmaBeamGlow = undefined;
+    }
+    if (render.plasmaBeamCore) {
+      render.group.remove(render.plasmaBeamCore);
+      (render.plasmaBeamCore.material as THREE.Material).dispose();
+      render.plasmaBeamCore = undefined;
+    }
+    if (render.plasmaCharge) {
+      render.group.remove(render.plasmaCharge);
+      (render.plasmaCharge.material as THREE.Material).dispose();
+      render.plasmaCharge = undefined;
+    }
     if (render.scarf) {
       render.group.remove(render.scarf);
       render.scarf.geometry.dispose();
@@ -3076,6 +3698,7 @@ type FoodVisual = {
         existing.tr = f.r;
         existing.color = f.color;
         existing.value = f.value;
+        existing.kind = f.kind;
         existing.present = true;
         existing.sucked = false;
         existing.suckLift = 0;
@@ -3090,6 +3713,7 @@ type FoodVisual = {
           tr: f.r,
           color: f.color,
           value: f.value,
+          kind: f.kind,
           present: true,
           alpha: 0,
           sucked: false,
@@ -3115,7 +3739,10 @@ type FoodVisual = {
           const head = p.segments[0];
           if (!head) continue;
           const headR = headRadiusForLength(p.segments.length);
-          const eatR = headR + prev.r + 18;
+          let eatR = headR + prev.r + 18;
+          if (skinHasMagnetPassive(p.skin)) eatR *= 3;
+          if (p.skillActive && p.skill === 'skill_viper_blender') eatR *= 1.25;
+          if (p.skillActive && p.skill === 'skill_void_maw') eatR *= 1.15;
           const hx = head.x - prev.x;
           const hy = head.y - prev.y;
           if (hx * hx + hy * hy <= eatR * eatR) {
@@ -3137,9 +3764,8 @@ type FoodVisual = {
 
         // Suction FX: only for Magnetic-class passive and suction-style skills.
         const suctionFx =
-          eater.dna === 'magnetic' ||
-          (eater.skillActive &&
-            (eater.skill === 'skill_viper_blender' || eater.skill === 'skill_void_maw'));
+          skinHasMagnetPassive(eater.skin) ||
+          (eater.skillActive && (eater.skill === 'skill_viper_blender' || eater.skill === 'skill_void_maw'));
 
         if (suctionFx) {
           spawnEatSuction(particles, from, to, prev.color, 'magnetic', prev.value);
@@ -3205,18 +3831,47 @@ type FoodVisual = {
     blackHoles = state.blackHoles ?? [];
 
     for (const hole of blackHoles) {
+      const existed = blackHoleRenders.has(hole.id);
       const render = ensureBlackHoleRender(hole.id);
+
       const remaining = hole.expiresAt - now;
-      const fade = clamp(remaining / 700, 0, 1);
+      const age = now - hole.createdAt;
+      const spawnT = clamp(age / 650, 0, 1);
+      const spawnE = spawnT * spawnT * (3 - 2 * spawnT); // smoothstep
+      const outroT = clamp(1 - remaining / 650, 0, 1);
+      const outroE = outroT * outroT;
+      const vis = clamp(spawnE * (1 - outroE), 0, 1);
 
       render.group.position.set(hole.x, 0.02, hole.y);
-      const outer = hole.r * 0.55;
+      const pop = 0.92 + 0.08 * Math.sin(spawnT * Math.PI);
+      const collapse = 1 - 0.92 * outroE;
+      const outer = hole.r * 0.55 * pop * collapse;
       render.group.scale.set(outer, 1, outer);
 
-      const coreMat = render.core.material as THREE.MeshBasicMaterial;
-      coreMat.opacity = 0.35 + fade * 0.6;
-      const ringMat = render.ring.material as THREE.MeshBasicMaterial;
-      ringMat.opacity = 0.18 + fade * 0.62;
+      const timeS = now / 1000;
+      const coreMat = render.core.material as THREE.ShaderMaterial;
+      coreMat.uniforms.uTime.value = timeS;
+      coreMat.uniforms.uAlpha.value = clamp(0.55 + 0.45 * (1 - outroE), 0, 1) * vis;
+
+      const diskMat = render.disk.material as THREE.ShaderMaterial;
+      diskMat.uniforms.uTime.value = timeS;
+      diskMat.uniforms.uAlpha.value = (0.8 + 0.2 * (1 - outroE)) * vis;
+
+      // Extra lens shimmer for a more "black hole" read.
+      render.disk.rotation.y = -timeS * 0.9 + render.seed * 0.3;
+      const lensMat = render.lens.material as THREE.MeshBasicMaterial;
+      lensMat.opacity = clamp((0.05 + 0.16 * (1 - outroE)) * vis, 0, 0.24);
+      const lensPulse = 1 + 0.08 * Math.sin(timeS * 2.2 + render.seed * 2.1);
+      render.lens.scale.set(lensPulse, 1, lensPulse);
+
+      if (!existed) {
+        spawnRing(particles, { x: hole.x, y: hole.y }, 0xa55cff, hole.r * 0.7);
+        spawnBurst(particles, { x: hole.x, y: hole.y }, 0xb000ff, 18);
+      } else if (!render.outroFxDone && remaining <= 120) {
+        render.outroFxDone = true;
+        spawnRing(particles, { x: hole.x, y: hole.y }, 0x00e5ff, hole.r * 0.8);
+        spawnBurst(particles, { x: hole.x, y: hole.y }, 0xa55cff, 20);
+      }
     }
 
     destroyMissingBlackHoles(blackHoles);
@@ -3225,15 +3880,23 @@ type FoodVisual = {
       const render = ensureIceZoneRender(zone.id);
       const remaining = zone.expiresAt - now;
       const fade = clamp(remaining / 900, 0, 1);
+      const timeS = now / 1000;
+      const phase = foodPhase(zone.id);
+      const pulse = 0.96 + 0.04 * Math.sin(timeS * 0.55 + phase * 1.7);
 
       render.group.position.set(zone.x, 0.02, zone.y);
       render.group.scale.set(zone.r, 1, zone.r);
-      render.fill.scale.set(0.985, 1, 0.985);
+      render.fill.scale.set(0.985 * pulse, 1, 0.985 * pulse);
+      render.pattern.scale.set(0.98, 1, 0.98);
+      render.pattern.rotation.y = timeS * 0.25 + phase * 0.7;
+      render.ring.rotation.y = -timeS * 0.35 + phase * 0.3;
 
       const fillMat = render.fill.material as THREE.MeshBasicMaterial;
-      fillMat.opacity = 0.08 + fade * 0.12;
+      fillMat.opacity = (0.12 + fade * 0.22) * pulse;
+      const patternMat = render.pattern.material as THREE.MeshBasicMaterial;
+      patternMat.opacity = (0.06 + fade * 0.28) * pulse;
       const ringMat = render.ring.material as THREE.MeshBasicMaterial;
-      ringMat.opacity = 0.18 + fade * 0.46;
+      ringMat.opacity = (0.32 + fade * 0.58) * pulse;
     }
 
     destroyMissingIceZones(ice);
@@ -3243,6 +3906,8 @@ type FoodVisual = {
       const render = ensurePlayerRender(id);
       const prevArmor = render.prevArmor;
       const prevStealth = render.prevStealth;
+      const prevSkill = render.prevSkill;
+      const prevSkillActive = render.prevSkillActive;
       syncTargetSegments(render, p.segments);
       render.name = p.name;
       render.color = p.color;
@@ -3266,6 +3931,54 @@ type FoodVisual = {
         shake = Math.max(shake, 0.55);
       }
 
+      const skillStarted = head && p.skillActive && (!prevSkillActive || prevSkill !== p.skill);
+      if (skillStarted && p.skill === 'skill_chrono_rewind') {
+        const base = 0xffb15a;
+        const fxColor = mixColor(base, 0xffffff, 0.25);
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 32);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.6);
+      }
+      if (skillStarted && p.skill === 'skill_plasma_ray') {
+        const fxColor = mixColor(0x00e5ff, 0xff2df7, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 36);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.8);
+      }
+      if (skillStarted && p.skill === 'skill_venom_gas') {
+        const fxColor = mixColor(0x00ff88, 0x8cff00, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 28);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.4);
+      }
+      if (skillStarted && p.skill === 'skill_frost_domain') {
+        const fxColor = mixColor(0x7be7ff, 0xffffff, 0.35 + Math.random() * 0.35);
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 30);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.6);
+      }
+      if (skillStarted && p.skill === 'skill_viper_blender') {
+        const fxColor = mixColor(0xd31f2a, 0xff3b2f, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 34);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.7);
+      }
+      if (skillStarted && p.skill === 'skill_eel_overdrive') {
+        const fxColor = mixColor(0x00e5ff, 0xffd34d, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 32);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.6);
+      }
+      if (skillStarted && p.skill === 'skill_scarab_thorns') {
+        const fxColor = mixColor(0xffd34d, 0xffffff, Math.random() * 0.4);
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 30);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.6);
+      }
+      if (skillStarted && p.skill === 'skill_mirage_clones') {
+        const fxColor = mixColor(0x00e5ff, 0xff4dff, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 34);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.6);
+      }
+      if (skillStarted && p.skill === 'skill_void_maw') {
+        const fxColor = mixColor(0xa55cff, 0xff007f, Math.random());
+        spawnBurst(particles, { x: head.x, y: head.y }, fxColor, 34);
+        spawnRing(particles, { x: head.x, y: head.y }, fxColor, headRadiusForLength(p.segments.length) * 2.7);
+      }
+
       if (head && p.dna === 'shadow' && p.stealth && !prevStealth && id === myId) {
         spawnBurst(particles, { x: head.x, y: head.y }, mixColor(0x00e5ff, 0xb000ff, Math.random()), 26);
         spawnRing(particles, { x: head.x, y: head.y }, 0x00e5ff, headRadiusForLength(p.segments.length) * 2.0);
@@ -3273,6 +3986,8 @@ type FoodVisual = {
 
       render.prevArmor = p.armor;
       render.prevStealth = p.stealth;
+      render.prevSkill = p.skill;
+      render.prevSkillActive = p.skillActive;
     }
 
     destroyMissingPlayers(state.players);
@@ -3296,6 +4011,8 @@ type FoodVisual = {
       render.visualLen = d.originalLen;
       render.prevArmor = 0;
       render.prevStealth = false;
+      render.prevSkill = render.skill;
+      render.prevSkillActive = false;
     }
 
     destroyMissingDecoys(state.decoys);
@@ -3577,7 +4294,6 @@ type FoodVisual = {
 
   function emitSkill(action: 'tap' | 'start' | 'end', target?: Vec2f): boolean {
     if (!socket || !socket.connected) return false;
-    if (mutationOpen) return false;
     if (target) {
       socket.emit('ability', { type: 'skill', action, x: target.x, y: target.y });
     } else {
@@ -3644,6 +4360,9 @@ type FoodVisual = {
     if (foodMesh.instanceColor) foodMesh.instanceColor.needsUpdate = true;
     gasMesh.count = 0;
     gasMesh.instanceMatrix.needsUpdate = true;
+    gasGlowMesh.count = 0;
+    gasGlowMesh.instanceMatrix.needsUpdate = true;
+    if (gasGlowMesh.instanceColor) gasGlowMesh.instanceColor.needsUpdate = true;
     particleGeometry.setDrawRange(0, 0);
     particlePosAttr.needsUpdate = true;
     particleColorAttr.needsUpdate = true;
@@ -3672,6 +4391,11 @@ type FoodVisual = {
       disposeRender(render);
     }
     decoyRenders.clear();
+
+    for (const [, render] of singularityFoodRenders) {
+      disposeSingularityFoodRender(render);
+    }
+    singularityFoodRenders.clear();
 
     for (const [, render] of blackHoleRenders) {
       disposeBlackHoleRender(render);
@@ -3910,7 +4634,6 @@ type FoodVisual = {
 
   skillBtn.addEventListener('pointerdown', (e: PointerEvent) => {
     if (!menu.classList.contains('hidden')) return;
-    if (mutationOpen) return;
     if (e.button !== 0) return;
 
     const s = getMySkillState();
@@ -4104,7 +4827,6 @@ type FoodVisual = {
     if (rightDown) {
       lastPointerRightDownAt = performance.now();
       e.preventDefault();
-      if (mutationOpen) return;
       const s = getMySkillState();
       if (!s) return;
 
@@ -4221,7 +4943,6 @@ type FoodVisual = {
     if (!menu.classList.contains('hidden')) return;
     if (performance.now() - lastPointerRightDownAt < RIGHT_CLICK_FALLBACK_MS) return;
     e.preventDefault();
-    if (mutationOpen) return;
 
     const s = getMySkillState();
     if (!s) return;
@@ -4346,6 +5067,24 @@ type FoodVisual = {
     const screenW = window.innerWidth;
     const screenH = window.innerHeight;
     const inMenu = !menu.classList.contains('hidden');
+
+    // Lobby swipe easing: drive CSS carousel vars and keep the 3D preview in sync.
+    if (inMenu) {
+      const k = lobbySwipeDragging ? 60 : 14;
+      lobbySwipeX = lerp(lobbySwipeX, lobbySwipeXTarget, smoothFactor(k, dt));
+      if (!lobbySwipeDragging && Math.abs(lobbySwipeX) < 0.35) lobbySwipeX = 0;
+      setLobbySwipeCss(lobbySwipeX);
+
+      if (!lobbySwipeDragging && lobbySwipeX === 0 && menu.classList.contains('swiping')) {
+        menu.classList.remove('swiping');
+      }
+    } else {
+      lobbySwipeDragging = false;
+      lobbySwipeX = 0;
+      lobbySwipeXTarget = 0;
+      setLobbySwipeCss(0);
+      menu.classList.remove('swiping');
+    }
 
     const meRender = myId ? playerRenders.get(myId) : undefined;
     const meHead = meRender?.segs[0];
@@ -4542,7 +5281,8 @@ type FoodVisual = {
       let cy = (view.minY + view.maxY) * 0.5 + viewH * 0.11;
 
       // Anchor the preview roughly at 2/5 of the screen width (and slightly below center) so it sits inside the left showcase.
-      const anchor = raycastWorld(screenW * 0.4, screenH * 0.6);
+      const swipePx = lobbySwipeX;
+      const anchor = raycastWorld(screenW * 0.4 + swipePx * 0.65, screenH * 0.6);
       if (anchor) {
         cx = anchor.x;
         cy = anchor.y;
@@ -4552,12 +5292,19 @@ type FoodVisual = {
       const turns = lobbyClass === 'iron' ? 1.15 : lobbyClass === 'shadow' ? 1.35 : 1.25;
       const outerR = lobbyClass === 'iron' ? 340 : lobbyClass === 'shadow' ? 300 : 320;
       const innerR = lobbyClass === 'iron' ? 110 : lobbyClass === 'shadow' ? 90 : 120;
-      const spin = -t * (lobbyClass === 'iron' ? 0.12 : lobbyClass === 'shadow' ? 0.18 : 0.16);
-      const wiggle = lobbyClass === 'iron' ? 0.04 : lobbyClass === 'shadow' ? 0.085 : 0.07;
+      const swipeP = clamp(swipePx / LOBBY_SWIPE_MAX_PX, -1, 1);
+      const swipeAbs = Math.abs(swipeP);
+      const spin =
+        -t * (lobbyClass === 'iron' ? 0.12 : lobbyClass === 'shadow' ? 0.18 : 0.16) + swipeP * 0.55;
+      const wiggle =
+        (lobbyClass === 'iron' ? 0.04 : lobbyClass === 'shadow' ? 0.085 : 0.07) + swipeAbs * 0.02;
 
       for (let i = 0; i < lobbyPreviewPose.length; i++) {
         const f = lobbyPreviewPose.length <= 1 ? 0 : i / (lobbyPreviewPose.length - 1);
-        const r = lerp(outerR, innerR, f) * (1 + Math.sin(t * 1.05 + f * 7.0 + seed * 6.0) * 0.03);
+        const r =
+          lerp(outerR, innerR, f) *
+          (1 - swipeAbs * 0.05) *
+          (1 + Math.sin(t * 1.05 + f * 7.0 + seed * 6.0) * 0.03);
         const a = spin + f * turns * Math.PI * 2 + Math.sin(t * 0.8 + f * 6.2 + seed * 10.0) * wiggle;
         lobbyPreviewPose[i]!.x = cx + Math.cos(a) * r;
         lobbyPreviewPose[i]!.y = cy + Math.sin(a) * r;
@@ -4620,6 +5367,12 @@ type FoodVisual = {
         cur.y = lerp(cur.y, target.y, a);
       }
 
+      // Keep the chain stitched during interpolation (prevents head/body separation in gameplay).
+      // Skip the lobby preview which uses a stylized pose, not fixed segment spacing.
+      if (id !== LOBBY_PREVIEW_ID) {
+        constrainChain(render.segs, SEGMENT_SPACING);
+      }
+
       // Light curvature relaxation so the body feels "soft" like slither.io.
       if (render.segs.length > 2) {
         for (let i = 1; i < render.segs.length - 1; i++) {
@@ -4629,6 +5382,15 @@ type FoodVisual = {
           cur.x = lerp(cur.x, (prev.x + next.x) * 0.5, relaxAlpha);
           cur.y = lerp(cur.y, (prev.y + next.y) * 0.5, relaxAlpha);
         }
+      }
+
+      if (id !== LOBBY_PREVIEW_ID) {
+        constrainChain(render.segs, SEGMENT_SPACING);
+
+        // Ensure the neck attaches directly behind the head (prevents "head on the side" look).
+        // We follow the server's intended curve directions for the first few links, but keep the head position smooth.
+        stitchChainToTargetDirections(render.segs, render.targetSegs, SEGMENT_SPACING, 24);
+        constrainChain(render.segs, SEGMENT_SPACING);
       }
     }
 
@@ -4673,6 +5435,8 @@ type FoodVisual = {
         cur.y = lerp(cur.y, target.y, a);
       }
 
+      constrainChain(render.segs, SEGMENT_SPACING);
+
       if (render.segs.length > 2) {
         for (let i = 1; i < render.segs.length - 1; i++) {
           const prev = render.segs[i - 1]!;
@@ -4682,6 +5446,11 @@ type FoodVisual = {
           cur.y = lerp(cur.y, (prev.y + next.y) * 0.5, relaxAlpha);
         }
       }
+
+      constrainChain(render.segs, SEGMENT_SPACING);
+
+      stitchChainToTargetDirections(render.segs, render.targetSegs, SEGMENT_SPACING, 24);
+      constrainChain(render.segs, SEGMENT_SPACING);
     }
 
     // Foods (culled)
@@ -4702,12 +5471,10 @@ type FoodVisual = {
       f.r = lerp(f.r, f.tr, posA);
       f.alpha = lerp(f.alpha, f.present ? 1 : 0, fadeA);
       if (!f.present && f.alpha <= 0.02) {
+        if (f.kind === 'singularity') destroySingularityFoodRender(id);
         foodVisuals.delete(id);
         continue;
       }
-
-      if (foodCount >= FOOD_MAX_INST) continue;
-      if (!isInsideView(f.x, f.y, view, foodMargin)) continue;
 
       const phase = foodPhase(f.id);
       // Slow, smooth "breathing" glow (avoid fast flicker).
@@ -4735,6 +5502,41 @@ type FoodVisual = {
         renderX += sx * swirl;
         renderY += sy * swirl;
       }
+
+      if (f.kind === 'singularity') {
+        const render = ensureSingularityFoodRender(id);
+        const valueBoost = Math.sqrt(Math.max(1, f.value));
+        const outerR = f.r * (2.55 + 0.42 * valueBoost) * (0.985 + 0.015 * Math.sin(t * 0.35 + phase)) * (0.7 + 0.3 * f.alpha);
+
+        const liftMax = f.suckLift > 0 ? f.suckLift : 46;
+        const coreLift = f.sucked ? swallowE * liftMax : 0;
+
+        const visible = isInsideView(renderX, renderY, view, foodMargin + outerR * 0.6);
+        render.group.visible = visible;
+
+        render.group.position.set(renderX, 0.24 + coreLift, renderY);
+        const scale = outerR * (0.98 + 0.02 * shimmer);
+        render.group.scale.set(scale, 1, scale);
+
+        const timeS = t * 0.55;
+        const coreMat = render.core.material as THREE.ShaderMaterial;
+        coreMat.uniforms.uTime.value = timeS;
+        coreMat.uniforms.uAlpha.value = clamp((0.75 - swallowE * 0.45) * f.alpha, 0, 1);
+
+        const diskMat = render.disk.material as THREE.ShaderMaterial;
+        diskMat.uniforms.uTime.value = timeS;
+        diskMat.uniforms.uAlpha.value = clamp((0.9 - swallowE * 0.6) * f.alpha, 0, 1);
+        render.disk.rotation.y = -timeS * 0.8 + render.seed * 0.4;
+
+        const lensMat = render.lens.material as THREE.MeshBasicMaterial;
+        lensMat.opacity = clamp((0.05 + 0.08 * (1 - swallowE)) * f.alpha, 0, 0.18);
+        const lensPulse = 1 + 0.08 * Math.sin(timeS * 2.2 + render.seed * 2.1);
+        render.lens.scale.set(lensPulse, 1, lensPulse);
+        continue;
+      }
+
+      if (foodCount >= FOOD_MAX_INST) continue;
+      if (!isInsideView(f.x, f.y, view, foodMargin)) continue;
 
       const coreR = f.r * (0.84 + f.value * 0.05) * pulse * fadeSize;
       const glowMul = f.sucked ? 1 - swallowE * 0.85 : 1;
@@ -4788,8 +5590,22 @@ type FoodVisual = {
       if (gasCount >= GAS_MAX_INST) break;
       if (!isInsideView(g.x, g.y, view, g.r + gasMargin)) continue;
 
+      const phase = foodPhase(g.id);
+      const pulse = 0.96 + 0.04 * Math.sin(t * 0.55 + phase);
+
+      const glowR = g.r * (1.65 + 0.12 * pulse);
+      tmpObj.position.set(g.x, 0.12 + g.r * 0.02, g.y);
+      tmpObj.quaternion.identity();
+      tmpObj.scale.set(glowR, glowR, glowR);
+      tmpObj.updateMatrix();
+      gasGlowMesh.setMatrixAt(gasCount, tmpObj.matrix);
+      tmpColor.setHex(shade(0x00ff88, 0.9 + 0.2 * pulse));
+      gasGlowMesh.setColorAt(gasCount, tmpColor);
+
       tmpObj.position.set(g.x, Math.max(1, g.r * 0.12), g.y);
-      tmpObj.scale.set(g.r, g.r * 0.35, g.r);
+      tmpObj.quaternion.identity();
+      const coreScale = 0.98 + 0.02 * pulse;
+      tmpObj.scale.set(g.r * coreScale, g.r * (0.32 + 0.05 * pulse), g.r * coreScale);
       tmpObj.updateMatrix();
       gasMesh.setMatrixAt(gasCount, tmpObj.matrix);
       gasCount++;
@@ -4802,6 +5618,9 @@ type FoodVisual = {
     }
     gasMesh.count = gasCount;
     gasMesh.instanceMatrix.needsUpdate = true;
+    gasGlowMesh.count = gasCount;
+    gasGlowMesh.instanceMatrix.needsUpdate = true;
+    if (gasGlowMesh.instanceColor) gasGlowMesh.instanceColor.needsUpdate = true;
 
     if (!menu.classList.contains('hidden')) {
       uiRoot.classList.remove('gas');
@@ -4842,8 +5661,18 @@ type FoodVisual = {
       applyClassVisual(render);
 
       const length = Math.max(1, render.visualLen || render.segs.length);
+      const chronoRewind = render.skillActive && skill === 'skill_chrono_rewind';
+      const phaseHard = phaseVisual && !chronoRewind;
       const siege = render.skillActive && skill === 'ultimate_iron_charge';
       const singularity = render.skillActive && skill === 'ultimate_magnetic_magnet';
+      const plasmaRay = render.skillActive && skill === 'skill_plasma_ray';
+      const venomGas = render.skillActive && skill === 'skill_venom_gas';
+      const frostDomain = render.skillActive && skill === 'skill_frost_domain';
+      const viperBlender = render.skillActive && skill === 'skill_viper_blender';
+      const eelOverdrive = render.skillActive && skill === 'skill_eel_overdrive';
+      const scarabThorns = render.skillActive && skill === 'skill_scarab_thorns';
+      const mirageClones = render.skillActive && skill === 'skill_mirage_clones';
+      const voidMaw = render.skillActive && skill === 'skill_void_maw';
 
       const sizeMul = siege ? 1.5 : 1;
       const bodyMul = render.dna === 'shadow' ? 0.78 : render.dna === 'iron' ? 1.06 : 1.18;
@@ -4874,13 +5703,11 @@ type FoodVisual = {
       const skinDef = SKIN_DEFS[skin];
       const skinAccent = skinDef?.accent ?? render.color;
 
-      let visMul = phaseVisual ? 0.18 : stealthVisual ? 0.28 : 1;
-      const baseAlphaMul = render.dna === 'shadow' ? 0.8 : render.dna === 'magnetic' ? 0.96 : 1;
+      const visMul = chronoRewind ? 0.68 : phaseHard ? 0.18 : stealthVisual ? 0.28 : 1;
       const spawnAlpha = clamp(1 - render.spawnFx * 0.45, 0.35, 1);
-      const opacity = clamp((boostingVisual ? 0.985 : 0.96) * baseAlphaMul * visMul * spawnAlpha, 0, 1);
-      let bodyOpacity = render.dna === 'shadow' ? opacity * 0.78 : opacity;
-      if (skin === 'frost') bodyOpacity *= 0.88;
-      if (skin === 'mirage') bodyOpacity *= 0.92;
+      const fade = clamp(visMul * spawnAlpha, 0, 1);
+      const fullyVisible = fade >= 0.999;
+      const bodyOpacity = fullyVisible ? 1 : clamp((boostingVisual ? 0.985 : 0.96) * fade, 0, 1);
 
       // Body material tuning per character skin.
       let metalness = 0.12;
@@ -4947,26 +5774,47 @@ type FoodVisual = {
         }
       }
 
-      if (stealthVisual || phaseVisual) emissiveIntensity = 0.0;
+      if (chronoRewind) {
+        emissiveHex = mixColor(skinAccent, 0xffd34d, 0.5);
+        emissiveIntensity = Math.max(emissiveIntensity, clamp(0.32 * spawnAlpha, 0, 0.75));
+      }
+
+      if (plasmaRay) {
+        emissiveHex = mixColor(skinAccent, 0x00e5ff, 0.55);
+        emissiveIntensity = Math.max(emissiveIntensity, clamp(0.62 * spawnAlpha, 0, 1.2));
+      }
+
+      if (venomGas) {
+        emissiveHex = mixColor(skinAccent, 0x00ff88, 0.65);
+        const mul = boostingVisual ? 0.28 : 0.18;
+        emissiveIntensity = Math.max(emissiveIntensity, clamp(mul * spawnAlpha, 0, 0.85));
+      }
+
+      if (frostDomain) {
+        emissiveHex = mixColor(skinAccent, 0xffffff, 0.35);
+        emissiveIntensity = Math.max(emissiveIntensity, clamp(0.2 * spawnAlpha, 0, 0.55));
+      }
+
+      if (stealthVisual || phaseHard) emissiveIntensity = 0.0;
 
       render.material.metalness = metalness;
       render.material.roughness = roughness;
       render.material.opacity = bodyOpacity;
-      render.material.transparent = true;
-      render.material.depthWrite = false;
+      render.material.transparent = bodyOpacity < 0.999;
+      render.material.depthWrite = bodyOpacity >= 0.999;
       render.material.emissive.setHex(emissiveHex);
       render.material.emissiveIntensity = emissiveIntensity;
 
-      const headOpacity = render.dna === 'shadow' ? clamp(bodyOpacity + 0.12, 0, 1) : bodyOpacity;
+      const headOpacity = bodyOpacity;
       for (const m of render.headMaterials) {
         m.opacity = headOpacity;
-        m.transparent = true;
-        m.depthWrite = false;
+        m.transparent = headOpacity < 0.999;
+        m.depthWrite = headOpacity >= 0.999;
 
         const u = m.userData as { baseEmissiveIntensity?: number };
         if (typeof u.baseEmissiveIntensity !== 'number') u.baseEmissiveIntensity = m.emissiveIntensity;
         if (u.baseEmissiveIntensity > 0) {
-          const glowFade = stealthVisual || phaseVisual ? 0 : spawnAlpha;
+          const glowFade = stealthVisual || phaseHard ? 0 : spawnAlpha;
           m.emissiveIntensity = u.baseEmissiveIntensity * glowFade;
         } else {
           m.emissiveIntensity = 0.0;
@@ -4985,18 +5833,20 @@ type FoodVisual = {
       render.shadow.position.set(head.x, 0.02, head.y);
       const shadowScale = headBase * (render.dna === 'iron' ? 1.5 : render.dna === 'magnetic' ? 1.55 : 1.45);
       render.shadow.scale.set(shadowScale, shadowScale, shadowScale);
-      shadowMat.opacity = clamp(0.2 * spawnAlpha * (stealthVisual || phaseVisual ? 0 : 1), 0, 0.22);
+      shadowMat.opacity = clamp(0.2 * spawnAlpha * (stealthVisual || phaseHard ? 0 : 1), 0, 0.22);
       render.shadow.visible = shadowMat.opacity > 0.01;
 
       // Class aura (ground ring)
       const auraMat = render.aura.material as THREE.MeshBasicMaterial;
       render.aura.position.set(head.x, 0.03, head.y);
-      render.aura.rotation.z = t * (render.dna === 'shadow' ? 2.0 : render.dna === 'magnetic' ? 1.2 : 0.8);
+      render.aura.rotation.z =
+        t * (render.dna === 'shadow' ? 2.0 : render.dna === 'magnetic' ? 1.2 : 0.8) +
+        (chronoRewind ? t * 0.8 : 0);
       let auraColor = render.dna === 'iron' ? ironAccent : render.dna === 'shadow' ? shadowNeon : mageNebula;
       let auraOpacity = 0;
       let auraScale = headBase * 2.2;
 
-      if (stealthVisual || phaseVisual) {
+      if (stealthVisual || phaseHard) {
         auraOpacity = 0;
       } else if (render.dna === 'iron') {
         auraColor = siege ? 0xff3b2f : mixColor(ironAccent, 0xffffff, 0.45);
@@ -5014,8 +5864,79 @@ type FoodVisual = {
         auraOpacity = 0.11 + (singularity ? 0.07 : 0.0);
       }
 
+      if (!stealthVisual && chronoRewind) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 2.4 + render.skinOffset * 8.0 + length * 0.03);
+        const warm = mixColor(0xffb15a, 0xffd34d, 0.35 + pulse * 0.35);
+        auraColor = mixColor(auraColor, warm, 0.75);
+        auraOpacity += 0.18 + pulse * 0.1;
+        auraScale *= 1.22 + pulse * 0.04;
+      }
+
+      if (!stealthVisual && plasmaRay) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 4.8 + render.skinOffset * 9.0 + length * 0.02);
+        const neon = mixColor(0x00e5ff, 0xff2df7, 0.35 + pulse * 0.35);
+        auraColor = mixColor(auraColor, neon, 0.78);
+        auraOpacity += 0.22 + pulse * 0.12;
+        auraScale *= 1.26 + pulse * 0.05;
+      }
+
+      if (!stealthVisual && venomGas) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 3.0 + render.skinOffset * 11.0 + length * 0.02);
+        const toxic = mixColor(0x00ff88, 0x8cff00, 0.25 + pulse * 0.35);
+        auraColor = mixColor(auraColor, toxic, 0.82);
+        auraOpacity += (boostingVisual ? 0.24 : 0.18) + pulse * 0.08;
+        auraScale *= 1.22 + pulse * 0.05;
+      }
+
+      if (!stealthVisual && frostDomain) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 2.2 + render.skinOffset * 10.0 + length * 0.02);
+        const ice = mixColor(0x7be7ff, 0xffffff, 0.25 + pulse * 0.35);
+        auraColor = mixColor(auraColor, ice, 0.8);
+        auraOpacity += 0.16 + pulse * 0.06;
+        auraScale *= 1.2 + pulse * 0.04;
+      }
+
+      if (!stealthVisual && viperBlender) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 5.2 + render.skinOffset * 7.0 + length * 0.02);
+        auraColor = mixColor(auraColor, 0xd31f2a, 0.78);
+        auraOpacity += 0.18 + pulse * 0.08;
+        auraScale *= 1.22 + pulse * 0.04;
+      }
+
+      if (!stealthVisual && eelOverdrive) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 6.2 + render.skinOffset * 8.0 + length * 0.02);
+        const electric = mixColor(0x00e5ff, 0xffd34d, 0.25 + pulse * 0.35);
+        auraColor = mixColor(auraColor, electric, 0.78);
+        auraOpacity += 0.18 + pulse * 0.1;
+        auraScale *= 1.22 + pulse * 0.05;
+      }
+
+      if (!stealthVisual && scarabThorns) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 4.2 + render.skinOffset * 9.0 + length * 0.02);
+        const gold = mixColor(0xffd34d, 0xffffff, 0.2 + pulse * 0.35);
+        auraColor = mixColor(auraColor, gold, 0.82);
+        auraOpacity += 0.16 + pulse * 0.08;
+        auraScale *= 1.2 + pulse * 0.04;
+      }
+
+      if (!stealthVisual && mirageClones) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 8.0 + render.skinOffset * 10.0 + length * 0.02);
+        const glitch = mixColor(0x00e5ff, 0xff4dff, pulse);
+        auraColor = mixColor(auraColor, glitch, 0.8);
+        auraOpacity += 0.18 + pulse * 0.1;
+        auraScale *= 1.22 + pulse * 0.04;
+      }
+
+      if (!stealthVisual && voidMaw) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 3.4 + render.skinOffset * 8.0 + length * 0.02);
+        const voidCol = mixColor(0xa55cff, 0xff007f, 0.25 + pulse * 0.35);
+        auraColor = mixColor(auraColor, voidCol, 0.8);
+        auraOpacity += 0.18 + pulse * 0.08;
+        auraScale *= 1.22 + pulse * 0.04;
+      }
+
       // Eating pulse: quick "chomp" feedback for all classes.
-      if (!stealthVisual && !phaseVisual && render.eatFx > 0) {
+      if (!stealthVisual && !phaseHard && render.eatFx > 0) {
         const chew = Math.sin((1 - render.eatFx) * Math.PI);
         auraOpacity += chew * 0.12;
         auraScale *= 1 + chew * 0.08;
@@ -5026,8 +5947,273 @@ type FoodVisual = {
       render.aura.scale.set(auraScale, auraScale, auraScale);
       render.aura.visible = auraMat.opacity > 0.01;
 
+      if (render.chronoRewindDisc) {
+        const active = chronoRewind && !stealthVisual && bodyOpacity > 0.02;
+        render.chronoRewindDisc.visible = active;
+        if (active) {
+          render.chronoRewindDisc.position.set(head.x, 0.027, head.y);
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.1 + render.skinOffset * 8.0);
+          const scale = headBase * (4.6 + pulse * 0.55);
+          render.chronoRewindDisc.scale.set(scale, scale, scale);
+          const mat = render.chronoRewindDisc.material as THREE.MeshBasicMaterial;
+          mat.color.setHex(mixColor(0xffb15a, 0xffd34d, 0.25 + pulse * 0.35));
+          mat.opacity = clamp((0.16 + pulse * 0.1) * spawnAlpha, 0, 0.44);
+        }
+      }
+
       // Head pose (silhouette first: 0.1s readability)
       const neck = render.segs[1] ?? render.targetSegs[1];
+      let dirX = 1;
+      let dirY = 0;
+      if (neck) {
+        const dx = head.x - neck.x;
+        const dy = head.y - neck.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0.001) {
+          const inv = 1 / Math.sqrt(d2);
+          dirX = dx * inv;
+          dirY = dy * inv;
+        }
+      }
+
+      const skillFxActive = render.skillActive && !stealthVisual && !phaseHard && bodyOpacity > 0.02;
+
+      if (render.plasmaBeamGlow && render.plasmaBeamCore && render.plasmaCharge) {
+        const active = plasmaRay && skillFxActive;
+        render.plasmaBeamGlow.visible = active;
+        render.plasmaBeamCore.visible = active;
+        render.plasmaCharge.visible = active;
+
+        if (active) {
+          tmpDir.set(dirX, 0, dirY).normalize();
+          tmpQuat.setFromUnitVectors(forward, tmpDir);
+
+          const startOff = headBase * 0.65;
+          const sx = head.x + dirX * startOff;
+          const sy = head.y + dirY * startOff;
+
+          const beamHeight = headBase * 0.68;
+          const len = PLASMA_RAY_RANGE;
+          const widthCore = PLASMA_RAY_HALF_WIDTH * 2.3;
+          const widthGlow = PLASMA_RAY_HALF_WIDTH * 4.4;
+
+          render.plasmaBeamGlow.position.set(sx, beamHeight, sy);
+          render.plasmaBeamGlow.quaternion.copy(tmpQuat);
+          render.plasmaBeamGlow.scale.set(widthGlow, 1, len);
+
+          render.plasmaBeamCore.position.set(sx, beamHeight + 0.01, sy);
+          render.plasmaBeamCore.quaternion.copy(tmpQuat);
+          render.plasmaBeamCore.scale.set(widthCore, 1, len);
+
+          const chargePulse = 0.5 + 0.5 * Math.sin(t * 10.5 + render.skinOffset * 14.0);
+          const chargeScale = headBase * (2.05 + chargePulse * 0.35);
+          render.plasmaCharge.position.set(head.x, headBase * 1.05, head.y);
+          render.plasmaCharge.scale.set(chargeScale, chargeScale, chargeScale);
+
+          const chargeMat = render.plasmaCharge.material as THREE.MeshBasicMaterial;
+          chargeMat.color.setHex(
+            mixColor(0xff2df7, 0x00e5ff, 0.5 + 0.5 * Math.sin(t * 2.2 + render.skinOffset * 8.0)),
+          );
+          chargeMat.opacity = clamp((0.16 + chargePulse * 0.2) * spawnAlpha, 0, 0.72);
+
+          const beamPulse = 0.8 + 0.2 * Math.sin(t * 12.0 + render.skinOffset * 12.0);
+          const colA = mixColor(0x00e5ff, skinAccent, 0.25);
+          const colB = mixColor(0xff2df7, skinAccent, 0.35);
+
+          const glowMat = render.plasmaBeamGlow.material as THREE.ShaderMaterial;
+          glowMat.uniforms.uTime.value = t;
+          glowMat.uniforms.uAlpha.value = clamp((0.55 + 0.25 * beamPulse) * spawnAlpha, 0, 1);
+          (glowMat.uniforms.uColorA.value as THREE.Color).setHex(colA);
+          (glowMat.uniforms.uColorB.value as THREE.Color).setHex(colB);
+
+          const coreMat = render.plasmaBeamCore.material as THREE.ShaderMaterial;
+          coreMat.uniforms.uTime.value = t + 0.07;
+          coreMat.uniforms.uAlpha.value = clamp((0.8 + 0.35 * beamPulse) * spawnAlpha, 0, 1);
+          (coreMat.uniforms.uColorA.value as THREE.Color).setHex(colA);
+          (coreMat.uniforms.uColorB.value as THREE.Color).setHex(colB);
+        }
+      }
+
+      if (!skillFxActive) {
+        render.skillFxAcc = 0;
+      } else if (chronoRewind) {
+        render.skillFxAcc += dt;
+        const interval = id === myId ? 0.05 : 0.07;
+        while (render.skillFxAcc >= interval) {
+          render.skillFxAcc -= interval;
+
+          const sx = -dirY;
+          const sy = dirX;
+          const off = rand(-1, 1) * headBase * 0.55;
+          const start = { x: head.x + sx * off + rand(-3, 3), y: head.y + sy * off + rand(-3, 3) };
+          const speed = rand(90, 210);
+          const side = rand(-1, 1) * rand(40, 120);
+          const life = rand(0.22, 0.48);
+          particles.push({
+            kind: 'dot',
+            x: start.x,
+            y: start.y,
+            vx: -dirX * speed + sx * side,
+            vy: -dirY * speed + sy * side,
+            r: rand(4.2, 10.5),
+            life,
+            maxLife: life,
+            color: mixColor(0xffb15a, 0xffd34d, 0.35 + Math.random() * 0.35),
+            alpha: rand(0.06, 0.12),
+          });
+
+          if (Math.random() < 0.22) {
+            const streakLife = rand(0.08, 0.18);
+            particles.push({
+              kind: 'spark',
+              x: start.x,
+              y: start.y,
+              vx: -dirX * (speed * 2.2),
+              vy: -dirY * (speed * 2.2),
+              r: rand(1, 2.1),
+              len: rand(10, 22),
+              rot: Math.atan2(dirY, dirX) + Math.PI + rand(-0.35, 0.35),
+              life: streakLife,
+              maxLife: streakLife,
+              color: mixColor(0xffd34d, 0xffffff, 0.25 + Math.random() * 0.3),
+              alpha: rand(0.08, 0.16),
+              lineWidth: rand(1.0, 1.9),
+            });
+          }
+
+          if (Math.random() < 0.1) {
+            spawnRing(particles, head, 0xffb15a, headBase * rand(1.9, 2.7));
+          }
+        }
+      } else if (plasmaRay) {
+        render.skillFxAcc += dt;
+        const interval = id === myId ? 0.06 : 0.09;
+        while (render.skillFxAcc >= interval) {
+          render.skillFxAcc -= interval;
+
+          const sx = -dirY;
+          const sy = dirX;
+          const along = rand(0.12, 1.0) * PLASMA_RAY_RANGE;
+          const spread = rand(-1, 1) * PLASMA_RAY_HALF_WIDTH * 0.9;
+          const at = {
+            x: head.x + dirX * (headBase * 0.65 + along) + sx * spread + rand(-3, 3),
+            y: head.y + dirY * (headBase * 0.65 + along) + sy * spread + rand(-3, 3),
+          };
+
+          const a = Math.atan2(dirY, dirX);
+          const speed = rand(140, 380);
+          const life = rand(0.08, 0.18);
+          particles.push({
+            kind: 'spark',
+            x: at.x,
+            y: at.y,
+            vx: dirX * speed + sx * rand(-140, 140),
+            vy: dirY * speed + sy * rand(-140, 140),
+            r: rand(1, 2.2),
+            len: rand(12, 26),
+            rot: a + rand(-0.6, 0.6),
+            life,
+            maxLife: life,
+            color: mixColor(0x00e5ff, 0xff2df7, Math.random()),
+            alpha: rand(0.1, 0.2),
+            lineWidth: rand(1.2, 2.1),
+          });
+
+          const dotLife = rand(0.12, 0.24);
+          particles.push({
+            kind: 'dot',
+            x: at.x,
+            y: at.y,
+            vx: sx * rand(-60, 60),
+            vy: sy * rand(-60, 60),
+            r: rand(2.6, 6.2),
+            life: dotLife,
+            maxLife: dotLife,
+            color: mixColor(0x00e5ff, 0xffffff, 0.25 + Math.random() * 0.25),
+            alpha: rand(0.06, 0.14),
+          });
+
+          if (Math.random() < 0.14) {
+            spawnRing(particles, at, 0x00e5ff, rand(18, 44));
+          }
+        }
+      } else if (venomGas) {
+        render.skillFxAcc += dt;
+        const interval = id === myId ? 0.09 : 0.12;
+        while (render.skillFxAcc >= interval) {
+          render.skillFxAcc -= interval;
+          if (!boostingVisual && Math.random() < 0.65) continue;
+
+          const sx = -dirY;
+          const sy = dirX;
+          const tail =
+            render.tailTip ??
+            (render.segs.length > 0
+              ? render.segs[render.segs.length - 1]
+              : render.targetSegs.length > 0
+                ? render.targetSegs[render.targetSegs.length - 1]
+                : head);
+          if (!tail) continue;
+
+          const off = rand(-1, 1) * bodyBase * 0.65;
+          const start = { x: tail.x + sx * off + rand(-6, 6), y: tail.y + sy * off + rand(-6, 6) };
+          const drift = rand(30, 90) + (boostingVisual ? rand(40, 120) : 0);
+          const life = rand(0.4, 0.85);
+          particles.push({
+            kind: 'dot',
+            x: start.x,
+            y: start.y,
+            vx: -dirX * drift + sx * rand(-50, 50),
+            vy: -dirY * drift + sy * rand(-50, 50),
+            r: rand(8, 18),
+            life,
+            maxLife: life,
+            color: mixColor(0x00ff88, 0x0b0d12, 0.2 + Math.random() * 0.25),
+            alpha: rand(0.05, 0.11),
+          });
+
+          if (Math.random() < 0.12) {
+            spawnRing(particles, start, 0x00ff88, rand(22, 52));
+          }
+        }
+      } else if (frostDomain) {
+        render.skillFxAcc += dt;
+        const interval = id === myId ? 0.1 : 0.14;
+        while (render.skillFxAcc >= interval) {
+          render.skillFxAcc -= interval;
+          const a = rand(-Math.PI, Math.PI);
+          const speed = rand(40, 120);
+          const life = rand(0.14, 0.28);
+
+          const sx = -dirY;
+          const sy = dirX;
+          const off = rand(-1, 1) * headBase * 0.65;
+          const start = { x: head.x + sx * off + rand(-3, 3), y: head.y + sy * off + rand(-3, 3) };
+
+          particles.push({
+            kind: 'spark',
+            x: start.x,
+            y: start.y,
+            vx: Math.cos(a) * speed,
+            vy: Math.sin(a) * speed,
+            r: rand(1, 2.0),
+            len: rand(10, 20),
+            rot: a,
+            life,
+            maxLife: life,
+            color: mixColor(0x7be7ff, 0xffffff, 0.25 + Math.random() * 0.45),
+            alpha: rand(0.08, 0.16),
+            lineWidth: rand(1.0, 1.8),
+          });
+
+          if (Math.random() < 0.12) {
+            spawnRing(particles, head, 0x7be7ff, headBase * rand(1.7, 2.4));
+          }
+        }
+      } else {
+        render.skillFxAcc = 0;
+      }
+
       let headDirOk = false;
       if (neck) {
         const dx = head.x - neck.x;
@@ -5126,7 +6312,7 @@ type FoodVisual = {
 
       // Class parts: Shadow scarf (Cyber Ninja) & Arcana rune circle (Mage).
       if (render.scarf) {
-        const scarfActive = skin === 'eel' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        const scarfActive = skin === 'eel' && !stealthVisual && !phaseVisual && bodyOpacity > 0.02;
         render.scarf.visible = scarfActive;
         if (scarfActive) {
           let fx = 1;
@@ -5175,7 +6361,11 @@ type FoodVisual = {
       }
 
       if (render.magicCircle) {
-        const magicActive = render.dna === 'magnetic' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        const magicActive =
+          skinHasMagnetPassive(skin) &&
+          !stealthVisual &&
+          !phaseVisual &&
+          bodyOpacity > 0.02;
         render.magicCircle.visible = magicActive;
         if (magicActive) {
           render.magicCircle.position.set(head.x, 0.035, head.y);
@@ -5253,6 +6443,9 @@ type FoodVisual = {
       } else if (skin === 'frost') {
         baseShapeX = 1.22;
         baseShapeZ = 1.1;
+      } else if (skin === 'slug') {
+        baseShapeX = 1.16;
+        baseShapeZ = 1.14;
       } else if (skin === 'eel') {
         baseShapeX = 0.68;
         baseShapeZ = 0.6;
@@ -5279,7 +6472,9 @@ type FoodVisual = {
 
       const magneticWaveAmp =
         render.dna === 'magnetic'
-          ? skin === 'plasma'
+          ? skin === 'slug'
+            ? 0.09
+            : skin === 'plasma'
             ? 0.04
             : skin === 'chrono'
               ? 0.06
@@ -5290,21 +6485,28 @@ type FoodVisual = {
                   : 0.08
           : 0;
 
-      const headDetail = pointCount === srcLen ? 0 : Math.min(12, bodyCount);
+      // When downsampling very long worms, keep the first few points at full resolution
+      // and map the remaining points into the remaining source range (prevents a visible "break" near the head).
+      const downsample = pointCount < srcLen;
+      const headKeep = downsample ? Math.min(13, pointCount) : pointCount;
+      const remPointDenom = Math.max(1, pointCount - headKeep - 1);
+      const remSrcSpan = Math.max(0, srcLen - headKeep - 1);
       for (let i = 0; i < bodyCount; i++) {
-        // When downsampling very long worms, always keep the first few head segments at full resolution.
-        // Otherwise the first rendered body link can connect head->seg[2..] and visually makes the head look "side-mounted".
+        const pointA = i;
+        const pointB = i + 1;
         let idxA: number;
         let idxB: number;
-        if (pointCount === srcLen) {
-          idxA = i;
-          idxB = i + 1;
-        } else if (i < headDetail) {
-          idxA = i;
-          idxB = i + 1;
+        if (!downsample || pointA < headKeep) {
+          idxA = pointA;
         } else {
-          idxA = Math.round((i / denom) * (srcLen - 1));
-          idxB = Math.round(((i + 1) / denom) * (srcLen - 1));
+          const k = pointA - headKeep;
+          idxA = headKeep + Math.floor((k / remPointDenom) * remSrcSpan);
+        }
+        if (!downsample || pointB < headKeep) {
+          idxB = pointB;
+        } else {
+          const k = pointB - headKeep;
+          idxB = headKeep + Math.floor((k / remPointDenom) * remSrcSpan);
         }
         const a = segs[idxA]!;
         const b = segs[idxB]!;
@@ -5320,6 +6522,9 @@ type FoodVisual = {
           ra *= wave;
           rb *= wave;
         }
+
+        // Reinforce the neck: match the first body link radius to the head so no skin can look "detached".
+        if (i === 0) rb = ra;
 
         const ax = a.x;
         const az = a.y;
@@ -5441,6 +6646,29 @@ type FoodVisual = {
           const swirl = 0.18 + 0.18 * Math.sin(t * 2.6 + fMid * 10.0);
           segColor = mixColor(segColor, skinAccent, swirl);
         }
+        if (plasmaRay) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 6.4 + fMid * 18.0 + render.skinOffset * 9.0);
+          const neon = mixColor(0x00e5ff, 0xff2df7, 0.35 + pulse * 0.35);
+          segColor = mixColor(segColor, neon, 0.22 + pulse * 0.18);
+          segColor = shade(segColor, 1.04 + pulse * 0.08);
+        }
+        if (venomGas) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.8 + fMid * 12.0 + render.skinOffset * 11.0);
+          const toxic = mixColor(0x00ff88, 0x8cff00, 0.25 + pulse * 0.35);
+          segColor = mixColor(segColor, toxic, (boostingVisual ? 0.26 : 0.18) + pulse * 0.1);
+          segColor = shade(segColor, 0.98 + pulse * 0.08);
+        }
+        if (frostDomain) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.0 + fMid * 10.0 + render.skinOffset * 10.0);
+          const ice = mixColor(0x7be7ff, 0xffffff, 0.25 + pulse * 0.25);
+          segColor = mixColor(segColor, ice, 0.18 + pulse * 0.08);
+          segColor = shade(segColor, 0.96 + pulse * 0.08);
+        }
+        if (chronoRewind) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 5.2 + fMid * 14.0 + render.skinOffset * 10.0);
+          segColor = mixColor(segColor, 0xffb15a, 0.18 + pulse * 0.14);
+          segColor = shade(segColor, 0.95 + pulse * 0.1);
+        }
 
         tmpObj.position.set((ax + bx) * 0.5, (ay + by) * 0.5, (az + bz) * 0.5);
         tmpObj.quaternion.setFromUnitVectors(up, tmpDir);
@@ -5471,7 +6699,7 @@ type FoodVisual = {
       const camDist = Math.hypot(head.x - camera.x, head.y - camera.y);
       const baseNameAlpha = clamp(1 - camDist / 1800, 0.15, 1);
       const nameMat = render.nameSprite.material as THREE.SpriteMaterial;
-      nameMat.opacity = baseNameAlpha * spawnAlpha * (stealthVisual || phaseVisual ? 0 : 1);
+      nameMat.opacity = baseNameAlpha * spawnAlpha * (stealthVisual || phaseHard ? 0 : 1);
       render.nameSprite.visible = nameMat.opacity > 0.02;
     }
 
@@ -5527,10 +6755,9 @@ type FoodVisual = {
       const visMul = phaseVisual ? 0.18 : stealthVisual ? 0.28 : 1;
       const shimmer = 0.92 + 0.08 * Math.sin(t * 18.3 + length * 0.11);
       const spawnAlpha = clamp(0.92 - render.spawnFx * 0.35, 0.45, 0.92);
-      const opacity = clamp(0.82 * shimmer * spawnAlpha * visMul, 0, 1);
-      let bodyOpacity = render.dna === 'shadow' ? opacity * 0.78 : opacity;
-      if (skin === 'frost') bodyOpacity *= 0.88;
-      if (skin === 'mirage') bodyOpacity *= 0.92;
+      const fade = clamp(visMul * spawnAlpha, 0, 1);
+      const fullyVisible = fade >= 0.999;
+      const bodyOpacity = fullyVisible ? 1 : clamp(0.82 * shimmer * fade, 0, 1);
 
       let metalness = 0.12;
       let roughness = 0.42;
@@ -5600,16 +6827,16 @@ type FoodVisual = {
       render.material.metalness = metalness;
       render.material.roughness = roughness;
       render.material.opacity = bodyOpacity;
-      render.material.transparent = true;
-      render.material.depthWrite = false;
+      render.material.transparent = bodyOpacity < 0.999;
+      render.material.depthWrite = bodyOpacity >= 0.999;
       render.material.emissive.setHex(emissiveHex);
       render.material.emissiveIntensity = emissiveIntensity;
 
-      const headOpacity = render.dna === 'shadow' ? clamp(bodyOpacity + 0.12, 0, 1) : bodyOpacity;
+      const headOpacity = bodyOpacity;
       for (const m of render.headMaterials) {
         m.opacity = headOpacity;
-        m.transparent = true;
-        m.depthWrite = false;
+        m.transparent = headOpacity < 0.999;
+        m.depthWrite = headOpacity >= 0.999;
 
         const u = m.userData as { baseEmissiveIntensity?: number };
         if (typeof u.baseEmissiveIntensity !== 'number') u.baseEmissiveIntensity = m.emissiveIntensity;
@@ -5758,7 +6985,7 @@ type FoodVisual = {
       }
 
       if (render.scarf) {
-        const scarfActive = skin === 'eel' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        const scarfActive = skin === 'eel' && !stealthVisual && !phaseVisual && bodyOpacity > 0.02;
         render.scarf.visible = scarfActive;
         if (scarfActive) {
           let fx = 1;
@@ -5807,7 +7034,11 @@ type FoodVisual = {
       }
 
       if (render.magicCircle) {
-        const magicActive = render.dna === 'magnetic' && !stealthVisual && !phaseVisual && opacity > 0.02;
+        const magicActive =
+          skinHasMagnetPassive(skin) &&
+          !stealthVisual &&
+          !phaseVisual &&
+          bodyOpacity > 0.02;
         render.magicCircle.visible = magicActive;
         if (magicActive) {
           render.magicCircle.position.set(head.x, 0.035, head.y);
@@ -5883,6 +7114,9 @@ type FoodVisual = {
       } else if (skin === 'frost') {
         baseShapeX = 1.22;
         baseShapeZ = 1.1;
+      } else if (skin === 'slug') {
+        baseShapeX = 1.16;
+        baseShapeZ = 1.14;
       } else if (skin === 'eel') {
         baseShapeX = 0.68;
         baseShapeZ = 0.6;
@@ -5909,7 +7143,9 @@ type FoodVisual = {
 
       const magneticWaveAmp =
         render.dna === 'magnetic'
-          ? skin === 'plasma'
+          ? skin === 'slug'
+            ? 0.09
+            : skin === 'plasma'
             ? 0.04
             : skin === 'chrono'
               ? 0.06
@@ -5920,19 +7156,26 @@ type FoodVisual = {
                   : 0.08
           : 0;
 
-      const headDetail = pointCount === srcLen ? 0 : Math.min(12, bodyCount);
+      const downsample = pointCount < srcLen;
+      const headKeep = downsample ? Math.min(13, pointCount) : pointCount;
+      const remPointDenom = Math.max(1, pointCount - headKeep - 1);
+      const remSrcSpan = Math.max(0, srcLen - headKeep - 1);
       for (let i = 0; i < bodyCount; i++) {
+        const pointA = i;
+        const pointB = i + 1;
         let idxA: number;
         let idxB: number;
-        if (pointCount === srcLen) {
-          idxA = i;
-          idxB = i + 1;
-        } else if (i < headDetail) {
-          idxA = i;
-          idxB = i + 1;
+        if (!downsample || pointA < headKeep) {
+          idxA = pointA;
         } else {
-          idxA = Math.round((i / denom) * (srcLen - 1));
-          idxB = Math.round(((i + 1) / denom) * (srcLen - 1));
+          const k = pointA - headKeep;
+          idxA = headKeep + Math.floor((k / remPointDenom) * remSrcSpan);
+        }
+        if (!downsample || pointB < headKeep) {
+          idxB = pointB;
+        } else {
+          const k = pointB - headKeep;
+          idxB = headKeep + Math.floor((k / remPointDenom) * remSrcSpan);
         }
         const a = segs[idxA]!;
         const b = segs[idxB]!;
@@ -5952,6 +7195,8 @@ type FoodVisual = {
           ra *= digest;
           rb *= digest;
         }
+
+        if (i === 0) rb = ra;
 
         const ax = a.x;
         const az = a.y;

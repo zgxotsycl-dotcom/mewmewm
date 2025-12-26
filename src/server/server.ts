@@ -17,6 +17,7 @@ import {
 import {
   classForSkin,
   defaultSkinForClass,
+  skinHasMagnetPassive,
   randomColorForSkin,
   randomSkinForClass,
   sanitizeSkin,
@@ -73,6 +74,9 @@ interface Food {
   color: number;
   value: number;
   kind: FoodKind;
+  // Optional overrides for special foods (e.g., Singularity "mega orb").
+  scoreValue?: number;
+  growthUnits?: number;
 }
 
 type ChronoSnapshot = { t: number; x: number; y: number; angle: number; scoreAcc: number; len: number };
@@ -121,6 +125,7 @@ interface Player {
   boostBurnAcc: number;
   gasDebuffUntil: number;
   iceSlipUntil: number;
+  frostSlowUntil: number;
   turnLockUntil: number;
   plasmaDamageAcc: number;
   skill: MutationId;
@@ -527,7 +532,8 @@ const SEGMENT_SPACING = 12;
 const HEAD_RADIUS = 18;
 const BODY_RADIUS = 14;
 // Head-trajectory trail: record head movement at a higher resolution so the tail can follow curves precisely.
-const TRAIL_POINT_MIN_DIST = 1; // 3에서 1로 변경하여 기록 해상도를 높임
+// NOTE: Extremely small on purpose so even very slow movement still records points (no neck separation).
+const TRAIL_POINT_MIN_DIST = 0.01;
 const TRAIL_BUFFER_DIST = 2400;
 const TRAIL_COMPACT_THRESHOLD = 2048;
 
@@ -612,6 +618,8 @@ const EEL_FIELD_RADIUS_EXTRA = 140;
 const FROST_DOMAIN_RADIUS = 820;
 const FROST_SLIP_LINGER_MS = 320;
 const FROST_SLIP_TURN_MUL = 0.45;
+const FROST_CHILL_LINGER_MS = 650;
+const FROST_CHILL_SPEED_MUL = 0.9;
 
 const PLASMA_RAY_RANGE = 1700;
 const PLASMA_RAY_HALF_WIDTH = 120;
@@ -657,7 +665,17 @@ const iceZones = new Map<string, IceZone>();
 let nextIceZoneId = 1;
 const iceGrid = new SpatialGrid<IceZone>(GRID_CELL_SIZE);
 
-type BlackHole = { id: string; ownerId: string; x: number; y: number; r: number; expiresAt: number };
+type BlackHole = {
+  id: string;
+  ownerId: string;
+  x: number;
+  y: number;
+  r: number;
+  createdAt: number;
+  expiresAt: number;
+  accScore: number;
+  accGrowth: number;
+};
 const blackHoles = new Map<string, BlackHole>();
 let nextBlackHoleId = 1;
 
@@ -694,7 +712,7 @@ type BotProfile = {
   skin: WormSkin;
 };
 
-type FoodKind = 'normal' | 'boost' | 'corpse' | 'bomb';
+type FoodKind = 'normal' | 'boost' | 'corpse' | 'bomb' | 'singularity';
 
 const botProfiles = new Map<string, BotProfile>();
 const spectatorCenters = new Map<string, Vec2>();
@@ -778,7 +796,7 @@ function classConfig(
       hitboxBodyMul: 0.9 * 0.9,
     };
   }
-  return { baseMul: 0.98, boostMul: 1.02, turnMul: 0.96, boostDrainMul: 1, eatMul: 3, hitboxHeadMul: 1.06, hitboxBodyMul: 1 };
+  return { baseMul: 0.98, boostMul: 1.02, turnMul: 0.96, boostDrainMul: 1, eatMul: 1, hitboxHeadMul: 1.06, hitboxBodyMul: 1 };
 }
 
 function grantIronArmorBoost(player: Player): void {
@@ -1068,6 +1086,10 @@ function nextEvoScoreForStage(stage: number): number {
 function buildMutationOffer(player: Player, tier: MutationStage, milestone: number): MutationOfferPayload | null {
   const isFinal = milestone >= EVO_THRESHOLDS[2];
   if (isFinal) {
+    // Magnetic Slug's kit is built around Singularity already (skin-based), and other magnetic skins
+    // should not be forced into the class ultimate (prevents multiple "magnet" characters).
+    if (player.dna === 'magnetic') return null;
+
     const ultimate = STAGE3_CLASS_ULTIMATE[player.dna] ?? STAGE3_CLASS_ULTIMATE.shadow;
     if (mutationStacks(player, ultimate) >= mutationMaxStacks(ultimate)) return null;
     return { stage: 3, choices: [mutationChoice(player, ultimate)] };
@@ -1322,7 +1344,6 @@ function skillEnergyFraction(player: Player, now: number, cooldownMs: number): n
 
 function tryStartShadowCloak(player: Player, now: number): void {
   if (player.skill !== 'shadow_phantom_decoy') return;
-  if (player.pendingStage !== 0) return;
 
   const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 18000;
   const energy = skillEnergyFraction(player, now, cooldownMs);
@@ -1339,9 +1360,6 @@ function stopSkillHold(player: Player): void {
 }
 
 function handleSkillAction(player: Player, now: number, action: SkillAction, x?: number, y?: number): void {
-  player.skill = SKIN_BASE_SKILL[player.skin] ?? CLASS_BASE_SKILL[player.dna];
-  if (player.pendingStage !== 0) return;
-
   if (player.skill === 'shadow_phantom_decoy') {
     if (action === 'end') {
       stopSkillHold(player);
@@ -1391,9 +1409,7 @@ function handleSkillAction(player: Player, now: number, action: SkillAction, x?:
 }
 
 function useSkill(player: Player, now: number, target?: Vec2): void {
-  player.skill = SKIN_BASE_SKILL[player.skin] ?? CLASS_BASE_SKILL[player.dna];
   if (now < player.skillCooldownUntil) return;
-  if (player.pendingStage !== 0) return;
 
   const id = player.skill;
   const cooldownMs = skillCooldownMs(player.dna, id) ?? 20000;
@@ -1479,7 +1495,10 @@ function useSkill(player: Player, now: number, target?: Vec2): void {
       x: pos.x,
       y: pos.y,
       r: SINGULARITY_RADIUS,
+      createdAt: now,
       expiresAt: now + SINGULARITY_MS,
+      accScore: 0,
+      accGrowth: 0,
     });
   } else if (id === 'ultimate_magnetic_goldrush') {
     player.skillActiveUntil = now + 6500;
@@ -1545,7 +1564,7 @@ function chooseFoodValue(): number {
 
 function spawnFood(at?: Vec2, value?: number, color?: number, kind: FoodKind = 'normal'): Food {
   const v = value ?? chooseFoodValue();
-  const rBonus = kind === 'corpse' ? 2 : 0;
+  const rBonus = kind === 'corpse' || kind === 'singularity' ? 2 : 0;
   const r = FOOD_BASE_R + v + rBonus;
 
   const pos = at ?? randomPointInArena(r + 6);
@@ -1732,6 +1751,7 @@ function createPlayer(
     boostBurnAcc: 0,
     gasDebuffUntil: 0,
     iceSlipUntil: 0,
+    frostSlowUntil: 0,
     turnLockUntil: 0,
     plasmaDamageAcc: 0,
     skill: SKIN_BASE_SKILL[skin] ?? CLASS_BASE_SKILL[dna],
@@ -1797,6 +1817,7 @@ function resetPlayerForLobbyChoice(player: Player, dna: WormClass, skin: WormSki
   player.boostBurnAcc = 0;
   player.gasDebuffUntil = 0;
   player.iceSlipUntil = 0;
+  player.frostSlowUntil = 0;
   player.turnLockUntil = 0;
   player.plasmaDamageAcc = 0;
 
@@ -1946,10 +1967,6 @@ function stepBot(player: Player, now: number): void {
 
 function stepSkillHolds(player: Player, now: number): void {
   if (!player.skillHeld) return;
-  if (player.pendingStage !== 0) {
-    player.skillHeld = false;
-    return;
-  }
 
   if (player.skill === 'shadow_phantom_decoy') {
     const cooldownMs = skillCooldownMs(player.dna, player.skill) ?? 18000;
@@ -2005,7 +2022,10 @@ function stepPlayer(player: Player, now: number): boolean {
 
   // Environmental debuffs (gas / ice).
   if (isInsideGas(head)) player.gasDebuffUntil = Math.max(player.gasDebuffUntil, now + GAS_DEBUFF_LINGER_MS);
-  if (isInsideIce(head, player.id)) player.iceSlipUntil = Math.max(player.iceSlipUntil, now + FROST_SLIP_LINGER_MS);
+  if (isInsideIce(head, player.id)) {
+    player.iceSlipUntil = Math.max(player.iceSlipUntil, now + FROST_SLIP_LINGER_MS);
+    player.frostSlowUntil = Math.max(player.frostSlowUntil, now + FROST_CHILL_LINGER_MS);
+  }
 
   const classCfg = classConfig(player.dna);
   const bunkered = isBunkerDownActive(player, now);
@@ -2041,6 +2061,9 @@ function stepPlayer(player: Player, now: number): boolean {
   if (player.skill === 'skill_eel_overdrive' && now < player.skillActiveUntil) {
     speedMul *= 1.85;
     turnMul *= 1.12;
+  }
+  if (now < player.frostSlowUntil) {
+    speedMul *= FROST_CHILL_SPEED_MUL;
   }
   if (now < player.iceSlipUntil) {
     turnMul *= FROST_SLIP_TURN_MUL;
@@ -2194,7 +2217,9 @@ function tryEatFood(player: Player, now: number): void {
   const classCfg = classConfig(player.dna);
   const headR = headRadiusForPlayer(player);
   const maxFoodR = FOOD_BASE_R + 3 + 2;
+  const magnetPassive = skinHasMagnetPassive(player.skin);
   let eatR = (headR + maxFoodR + 4) * classCfg.eatMul;
+  if (magnetPassive) eatR *= 3;
   if (now < player.magnetUntil) eatR *= 4;
 
   const viperBlender = player.skill === 'skill_viper_blender' && now < player.skillActiveUntil;
@@ -2203,7 +2228,7 @@ function tryEatFood(player: Player, now: number): void {
   if (voidMaw) eatR *= 1.15;
   const eatR2 = eatR * eatR;
 
-  const magneticPull = player.dna === 'magnetic';
+  const magneticPull = magnetPassive;
   let pullR = magneticPull ? (isSingularityActive(player, now) ? MAGNET_PULL_RADIUS_SINGULARITY : MAGNET_PULL_RADIUS) : 0;
   let pullMinSpeed = MAGNET_PULL_MIN_SPEED;
   let pullMaxSpeed = MAGNET_PULL_MAX_SPEED;
@@ -2275,18 +2300,25 @@ function tryEatFood(player: Player, now: number): void {
       continue;
     }
 
-    const scoreGain = 1 * player.scoreGainMul * (now < player.goldrushUntil ? 2 : 1);
+    const scoreUnits = typeof food.scoreValue === 'number' && Number.isFinite(food.scoreValue) ? food.scoreValue : 1;
+    const scoreGain = scoreUnits * player.scoreGainMul * (now < player.goldrushUntil ? 2 : 1);
     player.scoreAcc += scoreGain;
     player.score = Math.max(0, Math.floor(player.scoreAcc));
 
-    const growthUnitsBase = food.kind === 'corpse' ? food.value * CORPSE_GROWTH_PER_VALUE : food.value * FOOD_GROWTH_PER_VALUE;
+    const growthUnitsBase =
+      typeof food.growthUnits === 'number' && Number.isFinite(food.growthUnits)
+        ? food.growthUnits
+        : food.kind === 'corpse' || food.kind === 'singularity'
+          ? food.value * CORPSE_GROWTH_PER_VALUE
+          : food.value * FOOD_GROWTH_PER_VALUE;
     const growthUnits = growthUnitsBase * (player.hyperMetabolism ? HYPER_METABOLISM_GROWTH_MUL : 1);
     player.growthAcc += growthUnits;
   }
 }
 
-function killPlayer(player: Player, reason: string, killerDna?: WormClass): void {
+function killPlayer(player: Player, reason: string, killerDna?: WormClass, options?: { dropCorpse?: boolean }): void {
   const score = player.score;
+  const dropCorpse = options?.dropCorpse !== false;
   const shadowKillRewardMul = killerDna === 'shadow' ? SHADOW_KILL_REWARD_MUL : 1;
   const wallCrash = reason.includes('벽') || reason.includes('경계');
   const head = player.segments[0];
@@ -2302,6 +2334,7 @@ function killPlayer(player: Player, reason: string, killerDna?: WormClass): void
     if (zone.ownerId === player.id) iceZones.delete(id);
   }
 
+  if (dropCorpse) {
   // Wall crash: extra burst of pellets so it reads as an explosion.
   if (wallCrash) {
     if (head) {
@@ -2334,6 +2367,8 @@ function killPlayer(player: Player, reason: string, killerDna?: WormClass): void
     }
   }
 
+  }
+
   players.delete(player.id);
   if (!player.isBot) {
     io.to(player.id).emit('dead', { reason, score });
@@ -2360,14 +2395,15 @@ function stepBlackHoles(now: number): void {
         foods.delete(food.id);
         if (food.kind === 'bomb') continue;
 
-        const scoreGain = 1 * owner.scoreGainMul * (now < owner.goldrushUntil ? 2 : 1);
-        owner.scoreAcc += scoreGain;
-        owner.score = Math.max(0, Math.floor(owner.scoreAcc));
-
+        const scoreUnits = typeof food.scoreValue === 'number' && Number.isFinite(food.scoreValue) ? food.scoreValue : 1;
         const growthUnitsBase =
-          food.kind === 'corpse' ? food.value * CORPSE_GROWTH_PER_VALUE : food.value * FOOD_GROWTH_PER_VALUE;
-        const growthUnits = growthUnitsBase * (owner.hyperMetabolism ? HYPER_METABOLISM_GROWTH_MUL : 1);
-        owner.growthAcc += growthUnits;
+          typeof food.growthUnits === 'number' && Number.isFinite(food.growthUnits)
+            ? food.growthUnits
+            : food.kind === 'corpse' || food.kind === 'singularity'
+              ? food.value * CORPSE_GROWTH_PER_VALUE
+              : food.value * FOOD_GROWTH_PER_VALUE;
+        hole.accScore += scoreUnits;
+        hole.accGrowth += growthUnitsBase;
         continue;
       }
 
@@ -2389,6 +2425,20 @@ function handleCollisions(now: number): void {
   const radii = new Map<string, { head: number; body: number }>();
   for (const p of list) {
     radii.set(p.id, { head: headRadiusForPlayer(p), body: bodyRadiusForPlayer(p) });
+  }
+
+  // Singularity safety: worms that are fully inside the black hole core should not die from collisions.
+  // This keeps the effect as "pull/trap" rather than an instant execution.
+  const insideBlackHoleCore = new Set<string>();
+  for (const hole of blackHoles.values()) {
+    const coreR2 = hole.r * hole.r;
+    for (const p of list) {
+      const head = p.segments[0];
+      if (!head) continue;
+      const dx = head.x - hole.x;
+      const dy = head.y - hole.y;
+      if (dx * dx + dy * dy <= coreR2) insideBlackHoleCore.add(p.id);
+    }
   }
 
   // Singularity: pull small worms toward the black hole.
@@ -2452,6 +2502,7 @@ function handleCollisions(now: number): void {
   for (let i = 0; i < list.length; i++) {
     const a = list[i]!;
     if (toKill.has(a.id)) continue;
+    if (insideBlackHoleCore.has(a.id)) continue;
     if (now - a.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
     const ah = a.segments[0];
     if (!ah) continue;
@@ -2459,6 +2510,7 @@ function handleCollisions(now: number): void {
     for (let j = i + 1; j < list.length; j++) {
       const b = list[j]!;
       if (toKill.has(b.id)) continue;
+      if (insideBlackHoleCore.has(b.id)) continue;
       if (now - b.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
       const bh = b.segments[0];
       if (!bh) continue;
@@ -2562,6 +2614,7 @@ function handleCollisions(now: number): void {
 
   for (const player of list) {
     if (toKill.has(player.id)) continue;
+    if (insideBlackHoleCore.has(player.id)) continue;
     if (now - player.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
     if (isPhaseActive(player, now)) continue;
 
@@ -2579,6 +2632,7 @@ function handleCollisions(now: number): void {
 
       const other = players.get(entry.playerId);
       if (!other) continue;
+      if (insideBlackHoleCore.has(other.id)) continue;
       if (isPhaseActive(other, now)) continue;
 
       const bodyR = radii.get(other.id)?.body ?? BODY_RADIUS;
@@ -2621,6 +2675,7 @@ function handleCollisions(now: number): void {
     }
   }
 
+  /*
   // Singularity: absorb small worms that get too close.
   for (const hole of blackHoles.values()) {
     const owner = players.get(hole.ownerId);
@@ -2647,10 +2702,45 @@ function handleCollisions(now: number): void {
     }
   }
 
+  const findAbsorbingHole = (victim: Player): { hole: BlackHole; owner: Player } | undefined => {
+    const head = victim.segments[0];
+    if (!head) return undefined;
+
+    let best: { hole: BlackHole; owner: Player } | undefined;
+    let bestD2 = Number.POSITIVE_INFINITY;
+
+    for (const hole of blackHoles.values()) {
+      const owner = players.get(hole.ownerId);
+      if (!owner) continue;
+      if (victim.id === owner.id) continue;
+      if (now - victim.spawnedAt < SPAWN_INVULNERABLE_MS) continue;
+      if (isPhaseActive(victim, now)) continue;
+      if (isInvulnerableActive(victim, now)) continue;
+
+      const ownerLen = owner.segments.length;
+      const smallLimit = Math.max(MIN_SEGMENTS + 10, Math.floor(ownerLen * 0.72));
+      if (victim.segments.length > smallLimit) continue;
+
+      const dx = head.x - hole.x;
+      const dy = head.y - hole.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > hole.r * hole.r) continue;
+
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        best = { hole, owner };
+      }
+    }
+
+    return best;
+  };
+  */
+
   for (const [id, entry] of toKill) {
-    const player = players.get(id);
-    if (!player) continue;
-    killPlayer(player, entry.reason, entry.killerDna);
+    const victim = players.get(id);
+    if (!victim) continue;
+
+    killPlayer(victim, entry.reason, entry.killerDna);
   }
 }
 
@@ -2661,7 +2751,7 @@ function foodStreamRadiusForLength(length: number): number {
 
 function foodStreamRadiusForPlayer(player: Player, now: number): number {
   let radius = foodStreamRadiusForLength(player.segments.length);
-  if (player.dna === 'magnetic') radius *= 1.35;
+  if (skinHasMagnetPassive(player.skin)) radius *= 1.35;
   if (now < player.magnetUntil) radius *= 1.25;
   return radius;
 }
@@ -2721,6 +2811,7 @@ function buildBlackHolesPayload(): BlackHoleState[] {
       x: Math.round(hole.x),
       y: Math.round(hole.y),
       r: hole.r,
+      createdAt: hole.createdAt,
       expiresAt: hole.expiresAt,
     });
   }
@@ -2807,6 +2898,7 @@ function buildFoodsPayload(center: Vec2, radius: number): FoodState[] {
       r: food.r,
       color: food.color,
       value: food.value,
+      ...(food.kind === 'singularity' ? { kind: 'singularity' as const } : {}),
     }));
   }
 
@@ -2834,6 +2926,7 @@ function buildFoodsPayload(center: Vec2, radius: number): FoodState[] {
     r: food.r,
     color: food.color,
     value: food.value,
+    ...(food.kind === 'singularity' ? { kind: 'singularity' as const } : {}),
   }));
 }
 
@@ -2916,7 +3009,18 @@ function trimDecoys(now: number): void {
 
 function trimBlackHoles(now: number): void {
   for (const [id, hole] of blackHoles) {
-    if (now >= hole.expiresAt || !players.has(hole.ownerId)) blackHoles.delete(id);
+    const owner = players.get(hole.ownerId);
+    const expired = now >= hole.expiresAt;
+
+    // Magnetic Slug Singularity: everything absorbed collapses into one big food orb when the hole expires.
+    if (expired && owner && (hole.accScore > 0.001 || hole.accGrowth > 0.001)) {
+      const sizeValue = clamp(Math.round(hole.accGrowth / FOOD_GROWTH_PER_VALUE), 2, 36);
+      const orb = spawnFood({ x: hole.x, y: hole.y }, sizeValue, 0x0b0d12, 'singularity');
+      orb.scoreValue = hole.accScore;
+      orb.growthUnits = hole.accGrowth;
+    }
+
+    if (expired || !owner) blackHoles.delete(id);
   }
 }
 

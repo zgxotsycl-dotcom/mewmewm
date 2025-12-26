@@ -14,6 +14,7 @@ export const CLASS_BASE_SKILL: Record<WormClass, MutationId> = {
 
 // Base skill per character skin (available from game start).
 export const SKIN_BASE_SKILL: Record<WormSkin, MutationId> = {
+  slug: 'ultimate_magnetic_magnet',
   viper: 'skill_viper_blender',
   eel: 'skill_eel_overdrive',
   venom: 'skill_venom_gas',
